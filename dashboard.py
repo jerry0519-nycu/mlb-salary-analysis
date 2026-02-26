@@ -79,21 +79,54 @@ st.markdown(f"""
 # 數據載入函數
 # ============================================================
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)
 def load_data():
-    """從桌面匯出資料夾載入數據"""
-    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
-    data_path = os.path.join(os.path.dirname(__file__), "data", "merged_performance_salary.csv")
-    
-    if not os.path.exists(data_path):
-        st.error(f"❌ 找不到數據檔案: {data_path}")
-        st.info("請確認:")
-        st.info(f"1. 桌面有 'MLB專題_最新版本' 資料夾")
-        st.info(f"2. 已執行 auto_export.py 匯出數據")
-        return None
-    
+    """從雲端資料夾載入數據"""
     try:
-        # 直接讀取同資料夾的 data 檔案
-        df = pd.read_csv('data/merged_performance_salary.csv')
+        # 獲取當前程式所在的目錄
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 可能的數據檔案路徑列表（依優先順序）
+        possible_paths = [
+            os.path.join(current_dir, "data", "merged_performance_salary.csv"),
+            os.path.join(current_dir, "data", "processed", "merged_performance_salary.csv"),
+            os.path.join(current_dir, "merged_performance_salary.csv"),
+            os.path.join(current_dir, "mlb_salaries_2024", "data", "merged_performance_salary.csv"),
+            os.path.join(os.path.dirname(current_dir), "data", "merged_performance_salary.csv")
+        ]
+        
+        # 嘗試每個路徑
+        data_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                data_path = path
+                st.write(f"✅ 找到數據檔案: {data_path}")
+                break
+        
+        # 如果都找不到
+        if data_path is None:
+            st.error("❌ 找不到數據檔案")
+            st.write("請確認你的 GitHub 倉庫中有以下其中一個檔案：")
+            st.write("1. `data/merged_performance_salary.csv`")
+            st.write("2. `data/processed/merged_performance_salary.csv`")
+            st.write("3. `merged_performance_salary.csv`")
+            
+            # 顯示當前目錄結構（幫助除錯）
+            st.write("---")
+            st.write("📂 當前目錄結構：")
+            try:
+                files = os.listdir(current_dir)
+                st.write(f"根目錄: {files}")
+                if 'data' in files:
+                    data_files = os.listdir(os.path.join(current_dir, 'data'))
+                    st.write(f"data/ 目錄: {data_files}")
+            except:
+                pass
+            
+            return None
+        
+        # 讀取數據
+        df = pd.read_csv(data_path)
         st.success(f"✅ 成功載入 {len(df)} 筆數據")
 
         # 數據預處理
@@ -126,10 +159,12 @@ def load_data():
         
         if column_mapping:
             df = df.rename(columns=column_mapping)
+            
         if 'Team' in df.columns:
             df = df[df['Team'] != '---']
             df = df.dropna(subset=['Team'])
             df['Team'] = df['Team'].astype(str)
+            
         pos_map = {
             1: 'P', '1': 'P', '1.0': 'P',
             2: 'C', '2': 'C', '2.0': 'C',
