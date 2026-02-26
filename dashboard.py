@@ -2378,12 +2378,12 @@ elif analysis_mode == "公式與變數說明":
         
         st.markdown("""
         ### 進階分析指標
-        | 變數名 | 英文全名 | 中文名稱 | 計算公式/說明 | 重要性 |
-        |--------|----------|----------|--------------|--------|
-        | **WAR** | Wins Above Replacement | 勝場貢獻值 | **最重要指標**<br>衡量球員比替補球員多貢獻多少勝場 | ⭐⭐⭐⭐⭐ |
-        | **wOBA** | Weighted On-Base Average | 加權上壘率 | 考慮不同上壘方式的價值 | ⭐⭐⭐⭐ |
-        | **wRC+** | Weighted Runs Created Plus | 調整後得分創造 | 100為聯盟平均，>100優於平均 | ⭐⭐⭐⭐ |
-        | **OPS+** | Adjusted OPS | 調整後OPS | 考慮球場因素，100為聯盟平均 | ⭐⭐⭐ |
+        | 變數名 | 英文全名 | 中文名稱 | 計算公式/說明 | 
+        |--------|----------|----------|--------------|
+        | **WAR** | Wins Above Replacement | 勝場貢獻值 | 衡量球員比替補球員多貢獻多少勝場 | 
+        | **wOBA** | Weighted On-Base Average | 加權上壘率 | 考慮不同上壘方式的價值 | 
+        | **wRC+** | Weighted Runs Created Plus | 調整後得分創造 | 100為聯盟平均，>100優於平均 | 
+        | **OPS+** | Adjusted OPS | 調整後OPS | 考慮球場因素，100為聯盟平均 | 
         """)
     
     with tab3:
@@ -2643,4 +2643,5 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
