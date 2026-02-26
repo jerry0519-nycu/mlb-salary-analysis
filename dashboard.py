@@ -1666,14 +1666,20 @@ elif analysis_mode == "市場異常偵測":
         A = np.vstack([X.flatten(), np.ones(min_len)]).T
         slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
         
+        # 創建一個新的 DataFrame 來避免警告
         df_clean = df.copy()
         df_clean = df_clean.dropna(subset=['WAR', 'Salary_millions'])
         df_clean['expected_salary'] = slope * df_clean['WAR'] + intercept
         df_clean['salary_residual'] = df_clean['Salary_millions'] - df_clean['expected_salary']
         df_clean['residual_percent'] = (df_clean['salary_residual'] / df_clean['expected_salary']) * 100
         
-        df = df.merge(df_clean[['expected_salary', 'salary_residual', 'residual_percent']], 
-                      left_index=True, right_index=True, how='left')
+        # 合併回原 DataFrame
+        df = df.merge(
+            df_clean[['expected_salary', 'salary_residual', 'residual_percent']], 
+            left_index=True, 
+            right_index=True, 
+            how='left'
+        )
         
         # 閾值設定
         st.markdown("### 偵測設定")
@@ -1722,22 +1728,41 @@ elif analysis_mode == "市場異常偵測":
             st.markdown(f"#### 被低估球員 (< -{threshold}%)")
             
             if len(undervalued) > 0:
-                display_cols = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
-                display_cols = [col for col in display_cols if col in undervalued.columns]
+                # 準備要顯示的欄位
+                display_data = []
+                for idx, player in undervalued.head(20).iterrows():
+                    row = {
+                        'Name': player.get('Name', 'N/A'),
+                        'Team': player.get('Team', 'N/A'),
+                        'WAR': round(player.get('WAR', 0), 2),
+                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
+                    }
+                    if 'expected_salary' in player:
+                        row['expected_salary'] = round(player['expected_salary'], 2)
+                    if 'residual_percent' in player:
+                        row['residual_percent'] = round(player['residual_percent'], 1)
+                    display_data.append(row)
                 
-                undervalued_display = undervalued[display_cols].copy()
-                undervalued_display['residual_percent'] = undervalued_display['residual_percent'].round(1)
-                undervalued_display['expected_salary'] = undervalued_display['expected_salary'].round(2)
+                undervalued_display = pd.DataFrame(display_data)
+                
+                # 設定欄位格式
+                column_config = {
+                    'Name': '姓名',
+                    'Team': '球隊',
+                    'WAR': 'WAR',
+                    'Salary_millions': st.column_config.NumberColumn('實際薪資', format='$%.2fM')
+                }
+                
+                if 'expected_salary' in undervalued_display.columns:
+                    column_config['expected_salary'] = st.column_config.NumberColumn('預期薪資', format='$%.2fM')
+                if 'residual_percent' in undervalued_display.columns:
+                    column_config['residual_percent'] = st.column_config.NumberColumn('差異%', format='%.1f%%')
                 
                 st.dataframe(
-                    undervalued_display.head(20),
-                    use_container_width=True,  # 保留原始參數
+                    undervalued_display,
+                    use_container_width=True,
                     hide_index=True,
-                    column_config={
-                        "Salary_millions": st.column_config.NumberColumn("實際薪資", format="$%.2fM"),
-                        "expected_salary": st.column_config.NumberColumn("預期薪資", format="$%.2fM"),
-                        "residual_percent": st.column_config.NumberColumn("差異%", format="%.1f%%")
-                    }
+                    column_config=column_config
                 )
                 
                 # 下載按鈕
@@ -1756,22 +1781,41 @@ elif analysis_mode == "市場異常偵測":
             st.markdown(f"#### 被高估球員 (> {threshold}%)")
             
             if len(overvalued) > 0:
-                display_cols = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
-                display_cols = [col for col in display_cols if col in overvalued.columns]
+                # 準備要顯示的欄位
+                display_data = []
+                for idx, player in overvalued.head(20).iterrows():
+                    row = {
+                        'Name': player.get('Name', 'N/A'),
+                        'Team': player.get('Team', 'N/A'),
+                        'WAR': round(player.get('WAR', 0), 2),
+                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
+                    }
+                    if 'expected_salary' in player:
+                        row['expected_salary'] = round(player['expected_salary'], 2)
+                    if 'residual_percent' in player:
+                        row['residual_percent'] = round(player['residual_percent'], 1)
+                    display_data.append(row)
                 
-                overvalued_display = overvalued[display_cols].copy()
-                overvalued_display['residual_percent'] = overvalued_display['residual_percent'].round(1)
-                overvalued_display['expected_salary'] = overvalued_display['expected_salary'].round(2)
+                overvalued_display = pd.DataFrame(display_data)
+                
+                # 設定欄位格式
+                column_config = {
+                    'Name': '姓名',
+                    'Team': '球隊',
+                    'WAR': 'WAR',
+                    'Salary_millions': st.column_config.NumberColumn('實際薪資', format='$%.2fM')
+                }
+                
+                if 'expected_salary' in overvalued_display.columns:
+                    column_config['expected_salary'] = st.column_config.NumberColumn('預期薪資', format='$%.2fM')
+                if 'residual_percent' in overvalued_display.columns:
+                    column_config['residual_percent'] = st.column_config.NumberColumn('差異%', format='%.1f%%')
                 
                 st.dataframe(
-                    overvalued_display.head(20),
-                    use_container_width=True,  # 保留原始參數
+                    overvalued_display,
+                    use_container_width=True,
                     hide_index=True,
-                    column_config={
-                        "Salary_millions": st.column_config.NumberColumn("實際薪資", format="$%.2fM"),
-                        "expected_salary": st.column_config.NumberColumn("預期薪資", format="$%.2fM"),
-                        "residual_percent": st.column_config.NumberColumn("差異%", format="%.1f%%")
-                    }
+                    column_config=column_config
                 )
                 
                 # 下載按鈕
@@ -2599,3 +2643,4 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
