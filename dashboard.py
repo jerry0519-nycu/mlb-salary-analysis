@@ -1677,20 +1677,25 @@ elif analysis_mode == "市場異常偵測":
         """)
     
     if 'WAR' in df.columns and 'Salary_millions' in df.columns:
-        # 計算預期薪資
-        X = df[['WAR']].dropna().values
-        y = df['Salary_millions'].dropna().values
+        # 設定底薪門檻（排除還在領底薪的球員）
+        min_salary_threshold = 1.0  # 100萬美元以下視為底薪
         
-        min_len = min(len(X), len(y))
-        X = X[:min_len]
-        y = y[:min_len]
+        # 只使用薪資高於門檻的球員來建立回歸模型
+        df_model = df[df['Salary_millions'] > min_salary_threshold].dropna(subset=['WAR', 'Salary_millions']).copy()
         
-        A = np.vstack([X.flatten(), np.ones(min_len)]).T
+        if len(df_model) < 10:
+            st.warning(f"⚠️ 薪資高於 ${min_salary_threshold}M 的球員樣本不足 ({len(df_model)} 位)，無法建立可靠的回歸模型")
+            st.stop()
+        
+        # 計算預期薪資（使用高於底薪的球員建立模型）
+        X = df_model[['WAR']].values
+        y = df_model['Salary_millions'].values
+        
+        A = np.vstack([X.flatten(), np.ones(len(X))]).T
         slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
         
-        # 創建一個新的 DataFrame 來避免警告
-        df_clean = df.copy()
-        df_clean = df_clean.dropna(subset=['WAR', 'Salary_millions'])
+        # 為所有球員計算預期薪資
+        df_clean = df.dropna(subset=['WAR', 'Salary_millions']).copy()
         df_clean['expected_salary'] = slope * df_clean['WAR'] + intercept
         df_clean['salary_residual'] = df_clean['Salary_millions'] - df_clean['expected_salary']
         df_clean['residual_percent'] = (df_clean['salary_residual'] / df_clean['expected_salary']) * 100
@@ -1706,7 +1711,7 @@ elif analysis_mode == "市場異常偵測":
         # 閾值設定
         st.markdown("### 偵測設定")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             threshold = st.slider(
@@ -1722,8 +1727,24 @@ elif analysis_mode == "市場異常偵測":
                 help="只分析WAR高於此值的球員，避免極端小樣本影響"
             )
         
+        with col3:
+            exclude_rookies = st.checkbox(
+                "排除底薪球員 (< $1M)",
+                value=True,
+                help="排除還在領底薪的年輕球員，避免制度性低估"
+            )
+        
         # 篩選數據
         analysis_df = df[df['WAR'] >= min_war].copy()
+        
+        if exclude_rookies:
+            analysis_df = analysis_df[analysis_df['Salary_millions'] >= min_salary_threshold]
+            st.info(f"🔍 已排除底薪球員，分析 {len(analysis_df)} 位薪資高於 ${min_salary_threshold}M 的球員")
+        
+        # 確保需要的欄位存在且為數值型別
+        for col in ['expected_salary', 'salary_residual', 'residual_percent']:
+            if col in analysis_df.columns:
+                analysis_df[col] = pd.to_numeric(analysis_df[col], errors='coerce')
         
         # 識別異常值
         undervalued = analysis_df[analysis_df['residual_percent'] < -threshold].sort_values('residual_percent')
@@ -1743,34 +1764,57 @@ elif analysis_mode == "市場異常偵測":
         with col3:
             st.metric("被高估球員", len(overvalued))
         
+        # 顯示模型資訊
+        with st.expander("回歸模型資訊", expanded=False):
+            st.markdown(f"""
+            **模型建立基礎**：{len(df_model)} 位薪資高於 ${min_salary_threshold}M 的球員
+            
+            **回歸方程式**：`預期薪資 = {slope:.3f} × WAR + {intercept:.3f}`
+            
+            **每 1 WAR 價值**：${slope:.2f}M
+            
+            **基礎薪資**：${intercept:.2f}M
+            
+            **決定係數 R²**：{np.corrcoef(df_model['WAR'], df_model['Salary_millions'])[0,1]**2:.3f}
+            """)
+        
         # 詳細結果
         col1, col2 = st.columns(2)
-        
+
         with col1:
             st.markdown(f"#### 被低估球員 (< -{threshold}%)")
             
             if len(undervalued) > 0:
-                # 準備要顯示的欄位 - 直接用回歸結果計算預期薪資
-                display_data = []
-                for idx, player in undervalued.head(20).iterrows():
-                    # 直接用回歸方程式計算預期薪資
-                    war_value = player.get('WAR', 0)
-                    expected_salary = slope * war_value + intercept
-                    
-                    row = {
-                        '姓名': player.get('Name', 'N/A'),
-                        '球隊': player.get('Team', 'N/A'),
-                        'WAR': round(war_value, 2),
-                        '實際薪資(M)': round(player.get('Salary_millions', 0), 2),
-                        '預期薪資(M)': round(expected_salary, 2),
-                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
-                                round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
-                    }
-                    display_data.append(row)
+                # 準備要顯示的欄位
+                undervalued_display = undervalued.head(20).copy()
                 
-                undervalued_display = pd.DataFrame(display_data)
+                # 確保預期薪資欄位存在
+                if 'expected_salary' not in undervalued_display.columns:
+                    undervalued_display['expected_salary'] = slope * undervalued_display['WAR'] + intercept
                 
-                # 直接顯示表格
+                if 'residual_percent' not in undervalued_display.columns:
+                    undervalued_display['residual_percent'] = ((undervalued_display['Salary_millions'] - undervalued_display['expected_salary']) / undervalued_display['expected_salary']) * 100
+                
+                # 選擇要顯示的欄位（強制包含預期薪資）
+                display_columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
+                undervalued_display = undervalued_display[display_columns].copy()
+                
+                # 確保數值欄位是數值型別
+                undervalued_display['WAR'] = pd.to_numeric(undervalued_display['WAR'], errors='coerce')
+                undervalued_display['Salary_millions'] = pd.to_numeric(undervalued_display['Salary_millions'], errors='coerce')
+                undervalued_display['expected_salary'] = pd.to_numeric(undervalued_display['expected_salary'], errors='coerce')
+                undervalued_display['residual_percent'] = pd.to_numeric(undervalued_display['residual_percent'], errors='coerce')
+                
+                # 格式化數值
+                undervalued_display['WAR'] = undervalued_display['WAR'].round(2)
+                undervalued_display['Salary_millions'] = undervalued_display['Salary_millions'].round(2)
+                undervalued_display['expected_salary'] = undervalued_display['expected_salary'].round(2)
+                undervalued_display['residual_percent'] = undervalued_display['residual_percent'].round(1)
+                
+                # 重新命名欄位為中文
+                undervalued_display.columns = ['姓名', '球隊', 'WAR', '實際薪資(M)', '預期薪資(M)', '差異%']
+                
+                # 顯示表格
                 st.dataframe(
                     undervalued_display,
                     use_container_width=True,
@@ -1778,23 +1822,9 @@ elif analysis_mode == "市場異常偵測":
                 )
                 
                 # 下載按鈕
-                csv_data = []
-                for idx, player in undervalued.head(20).iterrows():
-                    war_value = player.get('WAR', 0)
-                    expected_salary = slope * war_value + intercept
-                    
-                    csv_row = {
-                        'Name': player.get('Name', 'N/A'),
-                        'Team': player.get('Team', 'N/A'),
-                        'WAR': round(war_value, 2),
-                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
-                        'expected_salary': round(expected_salary, 2),
-                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
-                                           round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
-                    }
-                    csv_data.append(csv_row)
-                
-                csv1 = pd.DataFrame(csv_data).to_csv(index=False)
+                download_df = undervalued_display.copy()
+                download_df.columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
+                csv1 = download_df.to_csv(index=False)
                 st.download_button(
                     label="📥 下載被低估球員名單",
                     data=csv1,
@@ -1804,32 +1834,41 @@ elif analysis_mode == "市場異常偵測":
                 )
             else:
                 st.info("未發現被低估的球員")
-        
+
         with col2:
             st.markdown(f"#### 被高估球員 (> {threshold}%)")
             
             if len(overvalued) > 0:
-                # 準備要顯示的欄位 - 直接用回歸結果計算預期薪資
-                display_data = []
-                for idx, player in overvalued.head(20).iterrows():
-                    # 直接用回歸方程式計算預期薪資
-                    war_value = player.get('WAR', 0)
-                    expected_salary = slope * war_value + intercept
-                    
-                    row = {
-                        '姓名': player.get('Name', 'N/A'),
-                        '球隊': player.get('Team', 'N/A'),
-                        'WAR': round(war_value, 2),
-                        '實際薪資(M)': round(player.get('Salary_millions', 0), 2),
-                        '預期薪資(M)': round(expected_salary, 2),
-                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
-                                round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
-                    }
-                    display_data.append(row)
+                # 準備要顯示的欄位
+                overvalued_display = overvalued.head(20).copy()
                 
-                overvalued_display = pd.DataFrame(display_data)
+                # 確保預期薪資欄位存在
+                if 'expected_salary' not in overvalued_display.columns:
+                    overvalued_display['expected_salary'] = slope * overvalued_display['WAR'] + intercept
                 
-                # 直接顯示表格
+                if 'residual_percent' not in overvalued_display.columns:
+                    overvalued_display['residual_percent'] = ((overvalued_display['Salary_millions'] - overvalued_display['expected_salary']) / overvalued_display['expected_salary']) * 100
+                
+                # 選擇要顯示的欄位（強制包含預期薪資）
+                display_columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
+                overvalued_display = overvalued_display[display_columns].copy()
+                
+                # 確保數值欄位是數值型別
+                overvalued_display['WAR'] = pd.to_numeric(overvalued_display['WAR'], errors='coerce')
+                overvalued_display['Salary_millions'] = pd.to_numeric(overvalued_display['Salary_millions'], errors='coerce')
+                overvalued_display['expected_salary'] = pd.to_numeric(overvalued_display['expected_salary'], errors='coerce')
+                overvalued_display['residual_percent'] = pd.to_numeric(overvalued_display['residual_percent'], errors='coerce')
+                
+                # 格式化數值
+                overvalued_display['WAR'] = overvalued_display['WAR'].round(2)
+                overvalued_display['Salary_millions'] = overvalued_display['Salary_millions'].round(2)
+                overvalued_display['expected_salary'] = overvalued_display['expected_salary'].round(2)
+                overvalued_display['residual_percent'] = overvalued_display['residual_percent'].round(1)
+                
+                # 重新命名欄位為中文
+                overvalued_display.columns = ['姓名', '球隊', 'WAR', '實際薪資(M)', '預期薪資(M)', '差異%']
+                
+                # 顯示表格
                 st.dataframe(
                     overvalued_display,
                     use_container_width=True,
@@ -1837,23 +1876,9 @@ elif analysis_mode == "市場異常偵測":
                 )
                 
                 # 下載按鈕
-                csv_data = []
-                for idx, player in overvalued.head(20).iterrows():
-                    war_value = player.get('WAR', 0)
-                    expected_salary = slope * war_value + intercept
-                    
-                    csv_row = {
-                        'Name': player.get('Name', 'N/A'),
-                        'Team': player.get('Team', 'N/A'),
-                        'WAR': round(war_value, 2),
-                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
-                        'expected_salary': round(expected_salary, 2),
-                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
-                                           round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
-                    }
-                    csv_data.append(csv_row)
-                
-                csv2 = pd.DataFrame(csv_data).to_csv(index=False)
+                download_df = overvalued_display.copy()
+                download_df.columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
+                csv2 = download_df.to_csv(index=False)
                 st.download_button(
                     label="📥 下載被高估球員名單",
                     data=csv2,
@@ -2677,6 +2702,7 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
