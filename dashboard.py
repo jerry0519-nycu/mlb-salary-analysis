@@ -1750,45 +1750,42 @@ elif analysis_mode == "市場異常偵測":
             st.markdown(f"#### 被低估球員 (< -{threshold}%)")
             
             if len(undervalued) > 0:
-                # 準備要顯示的欄位
+                # 準備要顯示的欄位 - 確保包含預期薪資
                 display_data = []
                 for idx, player in undervalued.head(20).iterrows():
                     row = {
-                        'Name': player.get('Name', 'N/A'),
-                        'Team': player.get('Team', 'N/A'),
+                        '姓名': player.get('Name', 'N/A'),
+                        '球隊': player.get('Team', 'N/A'),
                         'WAR': round(player.get('WAR', 0), 2),
-                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
+                        '實際薪資(M)': round(player.get('Salary_millions', 0), 2),
+                        '預期薪資(M)': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
+                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
                     }
-                    if 'expected_salary' in player:
-                        row['expected_salary'] = round(player['expected_salary'], 2)
-                    if 'residual_percent' in player:
-                        row['residual_percent'] = round(player['residual_percent'], 1)
                     display_data.append(row)
                 
                 undervalued_display = pd.DataFrame(display_data)
                 
-                # 設定欄位格式
-                column_config = {
-                    'Name': '姓名',
-                    'Team': '球隊',
-                    'WAR': 'WAR',
-                    'Salary_millions': st.column_config.NumberColumn('實際薪資', format='$%.2fM')
-                }
-                
-                if 'expected_salary' in undervalued_display.columns:
-                    column_config['expected_salary'] = st.column_config.NumberColumn('預期薪資', format='$%.2fM')
-                if 'residual_percent' in undervalued_display.columns:
-                    column_config['residual_percent'] = st.column_config.NumberColumn('差異%', format='%.1f%%')
-                
+                # 直接顯示表格，不透過 column_config（因為欄位名稱已經是中文化）
                 st.dataframe(
                     undervalued_display,
                     use_container_width=True,
-                    hide_index=True,
-                    column_config=column_config
+                    hide_index=True
                 )
                 
-                # 下載按鈕
-                csv1 = undervalued_display.to_csv(index=False)
+                # 下載按鈕（保留原始英文欄位名）
+                csv_data = []
+                for idx, player in undervalued.head(20).iterrows():
+                    csv_row = {
+                        'Name': player.get('Name', 'N/A'),
+                        'Team': player.get('Team', 'N/A'),
+                        'WAR': round(player.get('WAR', 0), 2),
+                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
+                        'expected_salary': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
+                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
+                    }
+                    csv_data.append(csv_row)
+                
+                csv1 = pd.DataFrame(csv_data).to_csv(index=False)
                 st.download_button(
                     label="📥 下載被低估球員名單",
                     data=csv1,
@@ -1803,45 +1800,42 @@ elif analysis_mode == "市場異常偵測":
             st.markdown(f"#### 被高估球員 (> {threshold}%)")
             
             if len(overvalued) > 0:
-                # 準備要顯示的欄位
+                # 準備要顯示的欄位 - 確保包含預期薪資
                 display_data = []
                 for idx, player in overvalued.head(20).iterrows():
                     row = {
-                        'Name': player.get('Name', 'N/A'),
-                        'Team': player.get('Team', 'N/A'),
+                        '姓名': player.get('Name', 'N/A'),
+                        '球隊': player.get('Team', 'N/A'),
                         'WAR': round(player.get('WAR', 0), 2),
-                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
+                        '實際薪資(M)': round(player.get('Salary_millions', 0), 2),
+                        '預期薪資(M)': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
+                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
                     }
-                    if 'expected_salary' in player:
-                        row['expected_salary'] = round(player['expected_salary'], 2)
-                    if 'residual_percent' in player:
-                        row['residual_percent'] = round(player['residual_percent'], 1)
                     display_data.append(row)
                 
                 overvalued_display = pd.DataFrame(display_data)
                 
-                # 設定欄位格式
-                column_config = {
-                    'Name': '姓名',
-                    'Team': '球隊',
-                    'WAR': 'WAR',
-                    'Salary_millions': st.column_config.NumberColumn('實際薪資', format='$%.2fM')
-                }
-                
-                if 'expected_salary' in overvalued_display.columns:
-                    column_config['expected_salary'] = st.column_config.NumberColumn('預期薪資', format='$%.2fM')
-                if 'residual_percent' in overvalued_display.columns:
-                    column_config['residual_percent'] = st.column_config.NumberColumn('差異%', format='%.1f%%')
-                
+                # 直接顯示表格
                 st.dataframe(
                     overvalued_display,
                     use_container_width=True,
-                    hide_index=True,
-                    column_config=column_config
+                    hide_index=True
                 )
                 
                 # 下載按鈕
-                csv2 = overvalued_display.to_csv(index=False)
+                csv_data = []
+                for idx, player in overvalued.head(20).iterrows():
+                    csv_row = {
+                        'Name': player.get('Name', 'N/A'),
+                        'Team': player.get('Team', 'N/A'),
+                        'WAR': round(player.get('WAR', 0), 2),
+                        'Salary_millions': round(player.get('Salary_millions', 0), 2),
+                        'expected_salary': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
+                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
+                    }
+                    csv_data.append(csv_row)
+                
+                csv2 = pd.DataFrame(csv_data).to_csv(index=False)
                 st.download_button(
                     label="📥 下載被高估球員名單",
                     data=csv2,
@@ -2665,6 +2659,7 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
