@@ -1124,39 +1124,72 @@ elif analysis_mode == "球員搜尋":
                     if len(selected_players) >= 2:
                         st.markdown("#### 比較圖表")
                         
-                        # 新增：雷達圖比較
+                        # 雷達圖比較
                         st.markdown("**能力值比較 (PR值雷達圖)**")
                         fig_radar = plot_player_radar(df, selected_players)
                         if fig_radar:
-                            st.plotly_chart(fig_radar, use_container_width=True)  # 保留原始參數
-
-                        # 原有的柱狀圖
-                        st.markdown("**數值直接比較**")
+                            st.plotly_chart(fig_radar, use_container_width=True)
+                    
+                        # 修改後的柱狀圖 - 每個球員兩根獨立柱子
+                        st.markdown("**數值直接比較 (薪資 vs WAR)**")
+                        
+                        # 準備數據
+                        compare_df_sorted = compare_df.sort_values('WAR', ascending=False)
+                        player_names = compare_df_sorted['Name'].tolist()
+                        
+                        # 創建圖表
                         fig = go.Figure()
                         
-                        fig.add_trace(go.Bar(
-                            x=compare_df['Name'],
-                            y=compare_df['WAR'],
-                            name='WAR',
-                            marker_color='blue'
-                        ))
+                        # 為每個球員添加兩根柱子
+                        for i, player in enumerate(player_names):
+                            player_data = compare_df_sorted[compare_df_sorted['Name'] == player].iloc[0]
+                            
+                            # WAR 柱子（左側）
+                            fig.add_trace(go.Bar(
+                                name='WAR' if i == 0 else '',  # 只在第一個顯示圖例
+                                x=[f"{player}<br>(WAR)"],
+                                y=[player_data['WAR']],
+                                marker_color='#1f77b4',  # 藍色
+                                showlegend=(i == 0),
+                                width=0.4,
+                                offset=-0.2,  # 向左偏移
+                                text=player_data['WAR'].round(2),
+                                textposition='auto',
+                            ))
+                            
+                            # 薪資柱子（右側）
+                            fig.add_trace(go.Bar(
+                                name='薪資 (M)' if i == 0 else '',  # 只在第一個顯示圖例
+                                x=[f"{player}<br>(薪資)"],
+                                y=[player_data['Salary_millions']],
+                                marker_color='#2ca02c',  # 綠色
+                                showlegend=(i == 0),
+                                width=0.4,
+                                offset=0.2,  # 向右偏移
+                                text=f"${player_data['Salary_millions'].round(2)}M",
+                                textposition='auto',
+                            ))
                         
-                        fig.add_trace(go.Bar(
-                            x=compare_df['Name'],
-                            y=compare_df['Salary_millions'],
-                            name='薪資 (M)',
-                            marker_color='green',
-                            yaxis='y2'
-                        ))
-                        
+                        # 更新版面配置
                         fig.update_layout(
                             title='球員WAR與薪資比較',
-                            yaxis=dict(title='WAR'),
-                            yaxis2=dict(title='薪資 (百萬美元)', overlaying='y', side='right'),
-                            barmode='group'
+                            xaxis_title='球員',
+                            yaxis_title='數值',
+                            barmode='group',  # 群組模式
+                            bargap=0.3,  # 群組間的間距
+                            bargroupgap=0.1,  # 群組內柱子間距
+                            height=500,
+                            xaxis_tickangle=-45,  # 旋轉標籤避免重疊
+                            legend=dict(
+                                orientation="h",
+                                yanchor="bottom",
+                                y=1.02,
+                                xanchor="right",
+                                x=1
+                            )
                         )
                         
-                        st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
+                        st.plotly_chart(fig, use_container_width=True)
 
 elif analysis_mode == "球隊分析":
     st.markdown('<h2 class="section-title">球隊分析</h2>', unsafe_allow_html=True)
@@ -2641,6 +2674,7 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
