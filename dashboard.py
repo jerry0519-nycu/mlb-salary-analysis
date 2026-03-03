@@ -1144,30 +1144,21 @@ elif analysis_mode == "球員搜尋":
                         for i, player in enumerate(player_names):
                             player_data = compare_df_sorted[compare_df_sorted['Name'] == player].iloc[0]
                             
-                            # WAR 柱子（左側）
                             fig.add_trace(go.Bar(
-                                name='WAR' if i == 0 else '',  # 只在第一個顯示圖例
-                                x=[f"{player}<br>(WAR)"],
-                                y=[player_data['WAR']],
-                                marker_color='#1f77b4',  # 藍色
-                                showlegend=(i == 0),
-                                width=0.4,
-                                offset=-0.2,  # 向左偏移
-                                text=player_data['WAR'].round(2),
-                                textposition='auto',
+                                name='WAR',
+                                x=player_names,  # 只用球員姓名
+                                y=compare_df_sorted['WAR'],
+                                marker_color='#1f77b4',
+                                offsetgroup=0,  # 第一個群組
                             ))
                             
-                            # 薪資柱子（右側）
+                            # 薪資柱子（整個群組的右側）
                             fig.add_trace(go.Bar(
-                                name='薪資 (M)' if i == 0 else '',  # 只在第一個顯示圖例
-                                x=[f"{player}<br>(薪資)"],
-                                y=[player_data['Salary_millions']],
-                                marker_color='#2ca02c',  # 綠色
-                                showlegend=(i == 0),
-                                width=0.4,
-                                offset=0.2,  # 向右偏移
-                                text=f"${player_data['Salary_millions'].round(2)}M",
-                                textposition='auto',
+                                name='薪資 (M)',
+                                x=player_names,  # 同一個 x 軸
+                                y=compare_df_sorted['Salary_millions'],
+                                marker_color='#2ca02c',
+                                offsetgroup=1,  # 第二個群組
                             ))
                         
                         # 更新版面配置
@@ -2674,6 +2665,7 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
