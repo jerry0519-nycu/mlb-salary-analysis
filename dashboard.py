@@ -1750,38 +1750,47 @@ elif analysis_mode == "市場異常偵測":
             st.markdown(f"#### 被低估球員 (< -{threshold}%)")
             
             if len(undervalued) > 0:
-                # 準備要顯示的欄位 - 確保包含預期薪資
+                # 準備要顯示的欄位 - 直接用回歸結果計算預期薪資
                 display_data = []
                 for idx, player in undervalued.head(20).iterrows():
+                    # 直接用回歸方程式計算預期薪資
+                    war_value = player.get('WAR', 0)
+                    expected_salary = slope * war_value + intercept
+                    
                     row = {
                         '姓名': player.get('Name', 'N/A'),
                         '球隊': player.get('Team', 'N/A'),
-                        'WAR': round(player.get('WAR', 0), 2),
+                        'WAR': round(war_value, 2),
                         '實際薪資(M)': round(player.get('Salary_millions', 0), 2),
-                        '預期薪資(M)': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
-                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
+                        '預期薪資(M)': round(expected_salary, 2),
+                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
+                                round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
                     }
                     display_data.append(row)
                 
                 undervalued_display = pd.DataFrame(display_data)
                 
-                # 直接顯示表格，不透過 column_config（因為欄位名稱已經是中文化）
+                # 直接顯示表格
                 st.dataframe(
                     undervalued_display,
                     use_container_width=True,
                     hide_index=True
                 )
                 
-                # 下載按鈕（保留原始英文欄位名）
+                # 下載按鈕
                 csv_data = []
                 for idx, player in undervalued.head(20).iterrows():
+                    war_value = player.get('WAR', 0)
+                    expected_salary = slope * war_value + intercept
+                    
                     csv_row = {
                         'Name': player.get('Name', 'N/A'),
                         'Team': player.get('Team', 'N/A'),
-                        'WAR': round(player.get('WAR', 0), 2),
+                        'WAR': round(war_value, 2),
                         'Salary_millions': round(player.get('Salary_millions', 0), 2),
-                        'expected_salary': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
-                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
+                        'expected_salary': round(expected_salary, 2),
+                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
+                                           round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
                     }
                     csv_data.append(csv_row)
                 
@@ -1800,16 +1809,21 @@ elif analysis_mode == "市場異常偵測":
             st.markdown(f"#### 被高估球員 (> {threshold}%)")
             
             if len(overvalued) > 0:
-                # 準備要顯示的欄位 - 確保包含預期薪資
+                # 準備要顯示的欄位 - 直接用回歸結果計算預期薪資
                 display_data = []
                 for idx, player in overvalued.head(20).iterrows():
+                    # 直接用回歸方程式計算預期薪資
+                    war_value = player.get('WAR', 0)
+                    expected_salary = slope * war_value + intercept
+                    
                     row = {
                         '姓名': player.get('Name', 'N/A'),
                         '球隊': player.get('Team', 'N/A'),
-                        'WAR': round(player.get('WAR', 0), 2),
+                        'WAR': round(war_value, 2),
                         '實際薪資(M)': round(player.get('Salary_millions', 0), 2),
-                        '預期薪資(M)': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
-                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
+                        '預期薪資(M)': round(expected_salary, 2),
+                        '差異%': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
+                                round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
                     }
                     display_data.append(row)
                 
@@ -1825,13 +1839,17 @@ elif analysis_mode == "市場異常偵測":
                 # 下載按鈕
                 csv_data = []
                 for idx, player in overvalued.head(20).iterrows():
+                    war_value = player.get('WAR', 0)
+                    expected_salary = slope * war_value + intercept
+                    
                     csv_row = {
                         'Name': player.get('Name', 'N/A'),
                         'Team': player.get('Team', 'N/A'),
-                        'WAR': round(player.get('WAR', 0), 2),
+                        'WAR': round(war_value, 2),
                         'Salary_millions': round(player.get('Salary_millions', 0), 2),
-                        'expected_salary': round(player.get('expected_salary', 0), 2) if pd.notna(player.get('expected_salary')) else 0,
-                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 0
+                        'expected_salary': round(expected_salary, 2),
+                        'residual_percent': round(player.get('residual_percent', 0), 1) if pd.notna(player.get('residual_percent')) else 
+                                           round(((player.get('Salary_millions', 0) - expected_salary) / expected_salary * 100), 1)
                     }
                     csv_data.append(csv_row)
                 
@@ -2659,6 +2677,7 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
