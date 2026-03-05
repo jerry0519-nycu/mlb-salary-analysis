@@ -1986,7 +1986,6 @@ elif analysis_mode == "進階策略分析":
             else:
                 st.error("樣本數不足，無法進行回歸分析")
 
-# 新增：原創財務指標頁面
 elif analysis_mode == "原創財務指標":
     st.markdown('<h2 class="section-title">原創財務指標分析</h2>', unsafe_allow_html=True)
     
@@ -2011,53 +2010,127 @@ elif analysis_mode == "原創財務指標":
         
         with tab1:
             st.markdown("### 加權綜合價值指數 (WVPI)")
-            st.markdown("""
+            st.markdown(r"""
             **WVPI** 是一個多維度的球員評估指標，結合了絕對表現、效率、相對排名與成本效益。
             
-            $$ \\text{WVPI} = w_1 \\times \\text{WAR} + w_2 \\times \\frac{\\text{WAR}}{\\text{Salary}} + w_3 \\times P_{\\text{WAR}} + w_4 \\times (100 - P_{\\text{Salary}}) $$
+            $$ \text{WVPI} = w_1 \times \text{WAR} + w_2 \times \frac{\text{WAR}}{\text{Salary}} + w_3 \times P_{\text{WAR}} + w_4 \times (100 - P_{\text{Salary}}) $$
             
-            **權重設定**: $w_1=0.35$ (絕對表現), $w_2=0.30$ (效率), $w_3=0.20$ (相對表現), $w_4=0.15$ (相對成本)
+            **本研究權重設定**: $w_1=0.35$ (絕對表現), $w_2=0.30$ (效率), $w_3=0.20$ (相對表現), $w_4=0.15$ (相對成本)
             """)
             
-            col1, col2 = st.columns(2)
+            # --- 提前計算 PCA 客觀權重與分數 ---
+            from sklearn.decomposition import PCA
+            from sklearn.preprocessing import StandardScaler
             
-            with col1:
-                # WVPI 排名
-                st.markdown("#### WVPI 最高球員 (前20名)")
-                top_wvpi = df.nlargest(20, 'WVPI')[['Name', 'Team', 'Position', 'WAR', 'Salary_millions', 'WVPI', 'WVPI_category']]
-                st.dataframe(top_wvpi, use_container_width=True, hide_index=True)  # 保留原始參數
+            comp_cols = ['WAR_norm', 'VR_norm', 'P_WAR', 'P_Salary_inv']
+            comp_names = ['絕對表現(WAR)', '效率(VR)', '相對表現(P_WAR)', '相對成本(P_Salary)']
             
-            with col2:
-                # WVPI 分布
-                fig = px.histogram(
-                    df,
-                    x='WVPI',
-                    color='WVPI_category',
-                    nbins=40,
-                    title='WVPI 分布與分類',
-                    labels={'WVPI': '加權綜合價值指數'}
+            if all(col in df.columns for col in comp_cols):
+                # 用乾淨的資料訓練 PCA
+                df_valid = df.dropna(subset=comp_cols + ['Name', 'Team']).copy()
+                data = df_valid[comp_cols]
+                
+                scaler = StandardScaler()
+                scaled_data = scaler.fit_transform(data)
+                
+                pca = PCA()
+                pca.fit(scaled_data)
+                
+                loadings = np.abs(pca.components_[0])
+                pca_weights = loadings / np.sum(loadings)
+                original_weights = np.array([0.35, 0.30, 0.20, 0.15])
+                correlation = np.corrcoef(original_weights, pca_weights)[0, 1]
+                
+                # 計算全聯盟的 PCA 客觀分數
+                df['WVPI_PCA'] = (
+                    pca_weights[0] * df['WAR_norm'] + 
+                    pca_weights[1] * df['VR_norm'] + 
+                    pca_weights[2] * df['P_WAR'] + 
+                    pca_weights[3] * df['P_Salary_inv']
                 )
-                st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
+                df_valid['WVPI_PCA'] = df['WVPI_PCA'] 
+            else:
+                pca_weights = None
             
-            # WVPI 分類解讀
-            st.markdown("**WVPI 分類解讀**")
-            col1, col2, col3, col4, col5 = st.columns(5)
+            # 使用子分頁(Sub-tabs)來整理 WVPI 的內容
+            wvpi_tab1, wvpi_tab2 = st.tabs(["📊 績效與排名分析", "⚖️ 權重設定客觀驗證 (PCA)"])
             
-            with col1:
-                top_count = len(df[df['WVPI_category'] == '頂級球星'])
-                st.metric("頂級球星", top_count)
-            with col2:
-                good_count = len(df[df['WVPI_category'] == '優質球員'])
-                st.metric("優質球員", good_count)
-            with col3:
-                avg_count = len(df[df['WVPI_category'] == '普通球員'])
-                st.metric("普通球員", avg_count)
-            with col4:
-                low_count = len(df[df['WVPI_category'] == '效率待提升'])
-                st.metric("效率待提升", low_count)
-            with col5:
-                bad_count = len(df[df['WVPI_category'] == '問題合約'])
-                st.metric("問題合約", bad_count)
+            with wvpi_tab1:
+                # 【新增】並排顯示兩個排行榜
+                col_table1, col_table2 = st.columns(2)
+                
+                with col_table1:
+                    st.markdown("#### 🏆 原創 WVPI 最高球員 (前20名)")
+                    top_wvpi = df.nlargest(20, 'WVPI')[['Name', 'Team', 'Position', 'WAR', 'Salary_millions', 'WVPI']]
+                    top_wvpi['排名'] = range(1, 21)
+                    # 四捨五入方便閱讀
+                    top_wvpi['WVPI'] = top_wvpi['WVPI'].round(2)
+                    st.dataframe(top_wvpi[['排名', 'Name', 'Team', 'WAR', 'Salary_millions', 'WVPI']], use_container_width=True, hide_index=True)
+                
+                with col_table2:
+                    if pca_weights is not None:
+                        st.markdown("#### 🤖 PCA 基準最高球員 (前20名)")
+                        top_pca = df.nlargest(20, 'WVPI_PCA')[['Name', 'Team', 'Position', 'WAR', 'Salary_millions', 'WVPI_PCA']]
+                        top_pca['排名'] = range(1, 21)
+                        # 四捨五入方便閱讀
+                        top_pca['WVPI_PCA'] = top_pca['WVPI_PCA'].round(2)
+                        st.dataframe(top_pca[['排名', 'Name', 'Team', 'WAR', 'Salary_millions', 'WVPI_PCA']], use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("無法計算 PCA 分數，請確認資料預處理。")
+                
+                st.markdown("---")
+                
+                # 【調整】把圖表和分類統計放到排行榜下方
+                col_chart, col_stat = st.columns([2, 1])
+                
+                with col_chart:
+                    fig = px.histogram(
+                        df, x='WVPI', color='WVPI_category', nbins=40,
+                        title='原創 WVPI 分布與分類', labels={'WVPI': '加權綜合價值指數'}
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col_stat:
+                    st.markdown("#### WVPI 分類解讀")
+                    st.metric("🌟 頂級球星", len(df[df['WVPI_category'] == '頂級球星']))
+                    st.metric("🔥 優質球員", len(df[df['WVPI_category'] == '優質球員']))
+                    st.metric("👍 普通球員", len(df[df['WVPI_category'] == '普通球員']))
+                    st.metric("⚠️ 效率待提升", len(df[df['WVPI_category'] == '效率待提升']))
+                    st.metric("📉 問題合約", len(df[df['WVPI_category'] == '問題合約']))
+
+            with wvpi_tab2:
+                if pca_weights is not None:
+                    st.markdown("#### WVPI 權重設定與 PCA 客觀驗證")
+                    st.info("本區塊運用主成分分析 (PCA)，萃取數據的自然最大變異方向作為「純客觀基準權重」。藉由比較我們基於財務邏輯「主觀設定」的權重與 PCA「客觀計算」的差異，檢驗本指標的合理性。")
+                    
+                    col_w1, col_w2 = st.columns([1, 2])
+                    
+                    with col_w1:
+                        st.markdown("##### 權重配置對比")
+                        compare_text = "| 評估維度 | 原創設定 | PCA客觀 |\n| :--- | :---: | :---: |\n"
+                        for name, orig, pca_w in zip(comp_names, original_weights, pca_weights):
+                            compare_text += f"| **{name}** | {orig*100:.1f}% | {pca_w*100:.1f}% |\n"
+                        st.markdown(compare_text)
+                        
+                        st.metric("兩組權重相似度 (Pearson)", f"{correlation*100:.1f}%")
+                        if correlation > 0.8:
+                            st.success("✅ 原創設定與數據自然特徵高度吻合。")
+                        else:
+                            st.warning("⚠️ 原創設定刻意偏離自然特徵，強調了性價比邏輯。")
+
+                    with col_w2:
+                        fig_scatter = px.scatter(
+                            df_valid, x='WVPI_PCA', y='WVPI', hover_name='Name',
+                            hover_data=['Team', 'WAR', 'Salary_millions'],
+                            labels={'WVPI_PCA': 'PCA純數據驅動分數', 'WVPI': '原創財務邏輯分數 (WVPI)'},
+                            title="全聯盟球員：兩種評分系統散點對比",
+                            color='WAR', color_continuous_scale='Viridis'
+                        )
+                        max_val = max(df_valid['WVPI'].max(), df_valid['WVPI_PCA'].max())
+                        fig_scatter.add_shape(type="line", x0=0, y0=0, x1=max_val, y1=max_val, line=dict(color="red", dash="dash"))
+                        st.plotly_chart(fig_scatter, use_container_width=True)
+                else:
+                    st.error("缺少計算所需的標準化變數。")
         
         with tab2:
             st.markdown("### 風險調整後價值 (RAV)")
@@ -2702,6 +2775,7 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
