@@ -81,81 +81,52 @@ st.markdown(f"""
 @st.cache_data(ttl=3600)
 @st.cache_data(ttl=3600)
 def load_data():
-    """從雲端資料夾載入數據"""
+    """從 GitHub 倉庫相對路徑載入數據，並執行 B 版本完整預處理"""
     try:
-        # 獲取當前程式所在的目錄
+        # 1. 獲取當前執行腳本的目錄
         current_dir = os.path.dirname(os.path.abspath(__file__))
         
-        # 可能的數據檔案路徑列表（依優先順序）
+        # 2. 定義在 GitHub 上可能存放數據的路徑 (按優先順序搜尋)
         possible_paths = [
             os.path.join(current_dir, "data", "merged_performance_salary.csv"),
             os.path.join(current_dir, "data", "processed", "merged_performance_salary.csv"),
             os.path.join(current_dir, "merged_performance_salary.csv"),
-            os.path.join(current_dir, "mlb_salaries_2024", "data", "merged_performance_salary.csv"),
-            os.path.join(os.path.dirname(current_dir), "data", "merged_performance_salary.csv")
+            os.path.join(current_dir, "notebooks", "data", "processed", "merged_performance_salary.csv")
         ]
         
-        # 嘗試每個路徑
         data_path = None
         for path in possible_paths:
             if os.path.exists(path):
                 data_path = path
-                st.write(f"✅ 找到數據檔案: {data_path}")
+                # st.success(f"✅ 找到數據檔案: {path}") # 除錯用，確認後可註解掉
                 break
         
-        # 如果都找不到
         if data_path is None:
-            st.error("❌ 找不到數據檔案")
-            st.write("請確認你的 GitHub 倉庫中有以下其中一個檔案：")
-            st.write("1. `data/merged_performance_salary.csv`")
-            st.write("2. `data/processed/merged_performance_salary.csv`")
-            st.write("3. `merged_performance_salary.csv`")
-            
-            # 顯示當前目錄結構（幫助除錯）
-            st.write("---")
-            st.write("📂 當前目錄結構：")
-            try:
-                files = os.listdir(current_dir)
-                st.write(f"根目錄: {files}")
-                if 'data' in files:
-                    data_files = os.listdir(os.path.join(current_dir, 'data'))
-                    st.write(f"data/ 目錄: {data_files}")
-            except:
-                pass
-            
+            st.error("❌ 找不到數據檔案：請確認 'merged_performance_salary.csv' 已上傳至 GitHub 倉庫。")
+            st.info("建議路徑：`/data/merged_performance_salary.csv` 或與 `dashboard.py` 同層級。")
             return None
-        
-        # 讀取數據
+            
+        # 3. 讀取數據
         df = pd.read_csv(data_path)
-        st.success(f"✅ 成功載入 {len(df)} 筆數據")
-
-        # 數據預處理
+        
+        # 4. 數據預處理 (B版本邏輯)
         if 'value_ratio' not in df.columns and 'WAR' in df.columns and 'Salary_millions' in df.columns:
             df['value_ratio'] = df['WAR'] / df['Salary_millions']
         
         # 標準化欄位名稱
         column_mapping = {}
-        
         if 'Team' not in df.columns:
-            possible_team_cols = ['Team_performance', 'Team_salary', 'team', 'TEAM']
-            for col in possible_team_cols:
+            for col in ['Team_performance', 'Team_salary', 'team', 'TEAM']:
                 if col in df.columns:
-                    column_mapping[col] = 'Team'
-                    break
-        
+                    column_mapping[col] = 'Team'; break
         if 'Position' not in df.columns:
-            possible_pos_cols = ['Position_salary', 'position', 'Pos', 'POS']
-            for col in possible_pos_cols:
+            for col in ['Position_salary', 'position', 'Pos', 'POS']:
                 if col in df.columns:
-                    column_mapping[col] = 'Position'
-                    break
-        
+                    column_mapping[col] = 'Position'; break
         if 'Name' not in df.columns:
-            possible_name_cols = ['Name_clean', 'Player', 'Player_formatted', 'player']
-            for col in possible_name_cols:
+            for col in ['Name_clean', 'Player', 'Player_formatted', 'player']:
                 if col in df.columns:
-                    column_mapping[col] = 'Name'
-                    break
+                    column_mapping[col] = 'Name'; break
         
         if column_mapping:
             df = df.rename(columns=column_mapping)
@@ -165,6 +136,7 @@ def load_data():
             df = df.dropna(subset=['Team'])
             df['Team'] = df['Team'].astype(str)
             
+        # 守備位置代碼轉換
         pos_map = {
             1: 'P', '1': 'P', '1.0': 'P',
             2: 'C', '2': 'C', '2.0': 'C',
@@ -177,27 +149,23 @@ def load_data():
             9: 'RF', '9': 'RF', '9.0': 'RF',
             10: 'DH', '10': 'DH', 'O': 'DH'
         }
-
         if 'Position' in df.columns:
             df['Position'] = df['Position'].apply(lambda x: pos_map.get(x, x))
 
-        # 計算財務分析指標
+        # 5. 計算基礎財務分布指標
         if 'Salary_millions' in df.columns:
             df['salary_percentile'] = df['Salary_millions'].rank(pct=True) * 100
             df['salary_category'] = pd.qcut(df['Salary_millions'], q=4, 
                                             labels=['低薪資', '中低薪資', '中高薪資', '高薪資'])
-        
         if 'WAR' in df.columns:
             df['war_percentile'] = df['WAR'].rank(pct=True) * 100
             df['war_category'] = pd.qcut(df['WAR'], q=4,
                                         labels=['低表現', '中低表現', '中高表現', '高表現'])
         
-        # ============================================================
-        # 新增：計算原創財務指標 (依據 new_variables.md)
-        # ============================================================
+        # 6. 計算原創財務指標 (WVPI, RAV, MERI 等)
         df = calculate_original_financial_metrics(df)
         
-        # 除錯：檢查 WVPI 分佈
+        # 7. 終端機除錯訊息 (Streamlit Cloud 的日誌會顯示)
         debug_wvpi(df)
         
         return df
@@ -2775,6 +2743,7 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 
