@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots  # 添加這行
+from plotly.subplots import make_subplots
 import os
 from datetime import datetime
 from scipy import stats
@@ -11,6 +11,8 @@ from scipy.optimize import minimize_scalar
 import warnings
 warnings.filterwarnings('ignore')
 import statsmodels.api as sm
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 # ============================================================
 # 設定頁面配置
@@ -2676,3 +2678,4 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
