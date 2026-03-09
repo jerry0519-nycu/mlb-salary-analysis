@@ -1,12 +1,16 @@
-# dashboard.py - MLB薪資表現分析儀表板（優化整合版）
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots  # 添加這行
 import os
 from datetime import datetime
-from scipy import stats  # 新增：用於計算百分位數和統計分佈
+from scipy import stats
+from scipy.optimize import minimize_scalar
+import warnings
+warnings.filterwarnings('ignore')
+import statsmodels.api as sm
 
 # ============================================================
 # 設定頁面配置
@@ -76,9 +80,8 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# 數據載入函數
+# 數據載入函數 (Streamlit Cloud 相容版)
 # ============================================================
-@st.cache_data(ttl=3600)
 @st.cache_data(ttl=3600)
 def load_data():
     """從 GitHub 倉庫相對路徑載入數據，並執行 B 版本完整預處理"""
@@ -317,57 +320,49 @@ def calculate_rav(df):
     
     return df
 
-def calculate_meri(df):
-    """計算市場效率殘差指數 (MERI)"""
-    if 'WAR' not in df.columns or 'Salary_millions' not in df.columns:
-        return df
+def calculate_meri(df, degree=4):
+    """市場效率殘差指數 (MERI) - 升級為雙軌制：單一變數 vs 全維度對照"""
+    df_out = df.copy()
+    if 'WAR' not in df_out.columns or 'Salary_millions' not in df_out.columns:
+        return df_out
     
-    # 清理數據
-    df_clean = df.dropna(subset=['WAR', 'Salary_millions']).copy()
-    
-    # 建立線性回歸模型 (WAR -> Salary)
-    X = df_clean[['WAR']].values
-    y = df_clean['Salary_millions'].values
-    
-    # 簡單線性回歸 (不使用外部庫)
-    X_mean = np.mean(X)
-    y_mean = np.mean(y)
-    
-    numerator = np.sum((X.flatten() - X_mean) * (y - y_mean))
-    denominator = np.sum((X.flatten() - X_mean) ** 2)
-    
-    beta = numerator / denominator if denominator != 0 else 0
-    alpha = y_mean - beta * X_mean
-    
-    # 計算預期薪資
-    df['expected_salary'] = alpha + beta * df['WAR']
-    
-    # 如果位置數據存在，加入位置調整 (簡化版)
-    if 'Position' in df.columns:
-        position_avg_residual = df.groupby('Position')['Salary_millions'].transform('mean') - \
-                                df.groupby('Position')['expected_salary'].transform('mean')
-        df['expected_salary_position'] = df['expected_salary'] + position_avg_residual
-    else:
-        df['expected_salary_position'] = df['expected_salary']
-    
-    # 計算殘差百分比
-    df['residual_pct'] = (df['Salary_millions'] - df['expected_salary_position']) / df['expected_salary_position']
-    
-    # 計算 MERI = 殘差百分比 × ln(1 + WAR)
-    df['MERI'] = df['residual_pct'] * np.log(1 + np.abs(df['WAR']))
-    
-    # 添加 MERI 分類 (依據 new_variables.md 4.6 節)
-    conditions = [
-        df['MERI'] > 0.5,
-        (df['MERI'] > 0.1) & (df['MERI'] <= 0.5),
-        (df['MERI'] >= -0.1) & (df['MERI'] <= 0.1),
-        (df['MERI'] >= -0.5) & (df['MERI'] < -0.1),
-        df['MERI'] < -0.5
-    ]
-    categories = ['嚴重高估', '稍微高估', '合理定價', '稍微低估', '嚴重低估']
-    df['MERI_category'] = np.select(conditions, categories, default='未知')
-    
-    return df
+    # --- A. 原有的單一變數 (WAR) 預期值 ---
+    mask = df_out['WAR'].notna() & df_out['Salary_millions'].notna()
+    X_war = df_out.loc[mask, 'WAR'].values
+    y = df_out.loc[mask, 'Salary_millions'].values
+    if len(X_war) > 0:
+        coeffs = np.polyfit(X_war, y, degree)
+        p = np.poly1d(coeffs)
+        df_out.loc[mask, 'expected_salary_simple'] = np.maximum(p(X_war), 0.7)
+        # 傳統 MERI
+        df_out.loc[mask, 'MERI_simple'] = (df_out.loc[mask, 'Salary_millions'] - df_out.loc[mask, 'expected_salary_simple']) / df_out.loc[mask, 'expected_salary_simple'] * np.log(1 + np.abs(df_out.loc[mask, 'WAR']))
+
+    # --- B. 新增：全維度多元模型殘差 ---
+    # 這裡我們預設一組打者與投手的通用變數組合來快速計算
+    try:
+        # 為了計算方便，先簡單區分 P 與非 P
+        for role in ['Hitter', 'Pitcher']:
+            if role == 'Hitter':
+                role_mask = mask & (~df_out['Position'].str.contains('P', na=False))
+                cols = ['WAR', 'Age', 'Years', 'wRC+', 'Def']
+            else:
+                role_mask = mask & df_out['Position'].str.contains('P', na=False)
+                cols = ['WAR', 'Age', 'Years']
+                
+            role_data = df_out[role_mask].dropna(subset=cols + ['Salary_millions']).copy()
+            if len(role_data) > 10:
+                role_data['Age2'] = role_data['Age']**2
+                X = sm.add_constant(role_data[cols + ['Age2']].astype(float))
+                y_log = np.log1p(role_data['Salary_millions'].astype(float))
+                res = sm.OLS(y_log, X).fit()
+                # 還原預測值
+                df_out.loc[role_data.index, 'expected_salary_multi'] = np.expm1(res.fittedvalues)
+                # 全維度 MERI (殘差)
+                df_out.loc[role_data.index, 'MERI_ultimate'] = (df_out.loc[role_data.index, 'Salary_millions'] - df_out.loc[role_data.index, 'expected_salary_multi'])
+    except:
+        pass # 避免資料缺失導致整個儀表板崩潰
+        
+    return df_out
 
 def calculate_team_psi(team_df, league_efficiency):
     """計算單一球隊的投資組合夏普指數 (PSI)"""
@@ -409,125 +404,117 @@ def calculate_sei(df):
     return correlation, gini, sei
 
 # ============================================================
-# 輔助函數 (含新增的高階分析函數)
+# 輔助函數 (升級：動態高次方多項式迴歸)
 # ============================================================
-def calculate_regression(x, y):
-    """計算線性回歸的替代方法（不使用statsmodels）"""
-    try:
-        A = np.vstack([x, np.ones(len(x))]).T
-        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+def format_poly_equation(coeffs, var_name="WAR"):
+    """將多項式係數格式化為漂亮的 LaTeX 數學方程式字串"""
+    terms = []
+    degree = len(coeffs) - 1
+    for i, c in enumerate(coeffs):
+        deg = degree - i
         
-        y_pred = slope * x + intercept
+        # 動態格式化：如果數字極小 (絕對值小於 0.001 且不為 0)，改用 LaTeX 科學記號
+        if abs(c) < 0.001 and c != 0:
+            base, exp = f"{c:.2e}".split('e')
+            c_str = f"{base} \\times 10^{{{int(exp)}}}"
+        else:
+            c_str = f"{c:.3f}"
+            
+        if deg == 0:
+            terms.append(f"{c_str}")
+        elif deg == 1:
+            terms.append(f"{c_str} \\text{{{var_name}}}")
+        else:
+            terms.append(f"{c_str} \\text{{{var_name}}}^{{{deg}}}")
+            
+    return " + ".join(terms).replace("+ -", "- ")
+
+def calculate_polynomial_regression(x, y, degree=1):
+    """計算高次方多項式迴歸"""
+    try:
+        # 使用 numpy 的 polyfit 進行高次擬合
+        coeffs = np.polyfit(x, y, degree)
+        p = np.poly1d(coeffs)
+        
+        y_pred = p(x)
         residuals = y - y_pred
         
         ss_res = np.sum(residuals**2)
         ss_tot = np.sum((y - np.mean(y))**2)
         r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
         
-        correlation = np.corrcoef(x, y)[0, 1] if len(x) > 1 else 0
-        
-        return slope, intercept, correlation, r_squared
+        return coeffs, p, r_squared
     except Exception as e:
-        st.warning(f"回歸計算發生錯誤: {e}")
-        return 0, 0, 0, 0
+        st.warning(f"迴歸計算發生錯誤: {e}")
+        return None, None, 0
 
-def add_regression_line(fig, df, x_col, y_col):
-    """手動添加回歸線到Plotly圖表"""
+def add_regression_line(fig, df, x_col, y_col, degree=1):
+    """手動添加高次迴歸曲線到Plotly圖表"""
     try:
-        # 計算回歸線
         x = df[x_col].dropna().values
         y = df[y_col].dropna().values
         min_len = min(len(x), len(y))
         x = x[:min_len]
         y = y[:min_len]
         
-        slope, intercept, _, _ = calculate_regression(x, y)
+        coeffs, p, r_squared = calculate_polynomial_regression(x, y, degree)
         
-        # 創建回歸線數據
-        x_range = np.linspace(x.min(), x.max(), 100)
-        y_pred = slope * x_range + intercept
-        
-        # 添加回歸線
-        fig.add_trace(
-            go.Scatter(
-                x=x_range,
-                y=y_pred,
-                mode='lines',
-                name='回歸線',
-                line=dict(color='red', width=2, dash='dash'),
-                showlegend=True
+        if p is not None:
+            # 創建平滑的回歸曲線數據 (100個點讓曲線平滑)
+            x_range = np.linspace(x.min(), x.max(), 100)
+            y_pred = p(x_range)
+            
+            # 防呆機制：預期薪資不能小於底薪 0.7M
+            if y_col == 'Salary_millions':
+                y_pred = np.maximum(y_pred, 0.7)
+            
+            # 添加迴歸曲線
+            fig.add_trace(
+                go.Scatter(
+                    x=x_range,
+                    y=y_pred,
+                    mode='lines',
+                    name=f'{degree}次方預測線 (R²={r_squared:.2f})',
+                    line=dict(color='red', width=3, dash='dash' if degree==1 else 'solid'),
+                    showlegend=True
+                )
             )
-        )
-        
     except Exception as e:
         pass
     
     return fig
 
-def manual_ols_regression(x, y):
-    """手動實現OLS回歸，避免依賴statsmodels，並提供完整統計量"""
+def manual_poly_regression_stats(x, y, degree):
+    """手動計算多項式回歸的統計量"""
     try:
-        # 添加常數項
-        X = np.column_stack([np.ones(len(x)), x])
+        n = len(x)
+        k = degree + 1  # 參數數量 (包含常數項)
         
-        # OLS公式: β = (X'X)^{-1}X'y
-        XTX = np.dot(X.T, X)
-        XTX_inv = np.linalg.inv(XTX)
-        beta = np.dot(XTX_inv, np.dot(X.T, y))
-        
-        # 計算預測值和殘差
-        y_pred = np.dot(X, beta)
+        coeffs, p, r_squared = calculate_polynomial_regression(x, y, degree)
+        y_pred = p(x)
         residuals = y - y_pred
         
-        # 計算統計量
-        n = len(x)
-        k = 2  # 截距 + 斜率
-        
-        # 殘差平方和
         ss_res = np.sum(residuals**2)
-        
-        # 總平方和
         ss_tot = np.sum((y - np.mean(y))**2)
         
-        # R²
-        r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
-        
-        # 調整後R²
+        # 調整後 R² (懲罰過多變數)
         adj_r_squared = 1 - (1 - r_squared) * (n - 1) / (n - k) if n > k else r_squared
         
-        # 標準誤
-        sigma2 = ss_res / (n - k)
-        var_beta = sigma2 * np.diag(XTX_inv)
-        std_err = np.sqrt(var_beta)
-        
-        # t統計量
-        t_values = beta / std_err
-        
-        # p值（使用t分布）
-        p_values = [2 * (1 - stats.t.cdf(np.abs(t), df=n-k)) for t in t_values]
-        
-        # F統計量
-        msr = (ss_tot - ss_res) / (k - 1)
-        mse = ss_res / (n - k)
+        # F 統計量
+        msr = (ss_tot - ss_res) / (k - 1) if k > 1 else 0
+        mse = ss_res / (n - k) if n > k else 0
         f_value = msr / mse if mse != 0 else 0
         
         return {
-            'intercept': beta[0],
-            'slope': beta[1],
+            'coeffs': coeffs,
+            'poly_obj': p,
             'r_squared': r_squared,
             'adj_r_squared': adj_r_squared,
-            'std_err_intercept': std_err[0],
-            'std_err_slope': std_err[1],
-            't_intercept': t_values[0],
-            't_slope': t_values[1],
-            'p_intercept': p_values[0],
-            'p_slope': p_values[1],
             'f_value': f_value,
             'n': n,
             'residuals': residuals
         }
     except Exception as e:
-        st.warning(f"手動回歸計算錯誤: {e}")
         return None
 
 def calculate_gini(series):
@@ -716,7 +703,7 @@ with st.sidebar:
     st.markdown("### 選擇分析功能")
     analysis_mode = st.selectbox(
         "選擇要進行的分析",
-        ["綜合儀表板", "球員搜尋", "球隊分析", "市場異常偵測", "進階策略分析", "原創財務指標", "公式與變數說明"],
+        ["綜合儀表板", "全維度薪資模型", "球員搜尋", "球隊分析", "市場異常偵測", "進階策略分析", "原創財務指標", "公式與變數說明"],
         key="analysis_mode"
     )
     
@@ -831,42 +818,46 @@ if analysis_mode == "綜合儀表板":
     
     with tab1:
         if 'WAR' in filtered_df.columns and 'Salary_millions' in filtered_df.columns:
+            # 加入多項式次方選擇器
+            st.markdown("#### ⚙️ 調整模型擬合度")
+            poly_degree = st.slider(
+                "選擇預期薪資模型次方數 (Degree)", 
+                min_value=1, max_value=8, value=1, step=1,
+                help="1為線性。3次方以上可捕捉巨星溢價，7~8次方可能產生過度擬合(Overfitting)。"
+            )
+            
             col1, col2 = st.columns([2, 1])
             
             with col1:
                 # 散點圖
                 fig = px.scatter(
-                    filtered_df,
-                    x='WAR',
-                    y='Salary_millions',
+                    filtered_df, x='WAR', y='Salary_millions',
                     hover_name='Name' if 'Name' in filtered_df.columns else None,
                     hover_data=['Team', 'Position'] if all(col in filtered_df.columns for col in ['Team', 'Position']) else None,
-                    title='薪資與表現關係圖',
+                    title=f'薪資與表現關係圖 ({poly_degree}次方多項式擬合)',
                     labels={'WAR': '勝場貢獻值 (WAR)', 'Salary_millions': '薪資 (百萬美元)'}
                 )
                 
-                # 添加回歸線
-                fig = add_regression_line(fig, filtered_df, 'WAR', 'Salary_millions')
-                
-                st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
-                # 替換為: st.plotly_chart(fig, width='stretch')
+                # 添加高次迴歸線
+                fig = add_regression_line(fig, filtered_df, 'WAR', 'Salary_millions', degree=poly_degree)
+                st.plotly_chart(fig, use_container_width=True)
             
             with col2:
                 # 統計分析
                 x = filtered_df['WAR'].dropna().values
                 y = filtered_df['Salary_millions'].dropna().values
-                min_len = min(len(x), len(y))
-                x = x[:min_len]
-                y = y[:min_len]
                 
-                slope, intercept, correlation, r_squared = calculate_regression(x, y)
+                coeffs, p_obj, r_squared = calculate_polynomial_regression(x, y, degree=poly_degree)
                 
-                st.markdown("#### 回歸分析結果")
-                st.write(f"**回歸方程:**")
-                st.code(f"薪資 = {slope:.3f} × WAR + {intercept:.3f}")
+                st.markdown("#### 迴歸分析結果")
+                st.markdown("**模型方程式:**")
+                eq_str = format_poly_equation(coeffs, 'WAR')
+                st.markdown(rf"$$ \widehat{{\text{{Salary}}}} = {eq_str} $$")
                 st.write(f"**決定係數 R²:** {r_squared:.3f}")
-                st.write(f"**解釋力:** {r_squared*100:.1f}%")
-                st.write(f"**每1 WAR價值:** ${slope:.2f}M")
+                st.write(f"**模型解釋力:** {r_squared*100:.1f}%")
+                
+                if poly_degree >= 5:
+                    st.warning("⚠️ **過度擬合警告**：高次方多項式雖能完美穿過資料點，但會失去外插預測力。")
     
     with tab2:
         col1, col2 = st.columns(2)
@@ -994,6 +985,188 @@ if analysis_mode == "綜合儀表板":
         mime="text/csv"
     )
 
+elif analysis_mode == "全維度薪資模型":
+    st.markdown('<h2 class="section-title">⚖️ 全維度薪資特徵定價模型 (Hedonic Pricing Model)</h2>', unsafe_allow_html=True)
+    
+    # --- 1. 學術規格說明與理論背景 ---
+    st.markdown("""
+    <div class="info-box">
+    <b>🏛️ 計量經濟學理論背景：</b><br>
+    本分析採用 <b>Hedonic Pricing (特徵定價法)</b> 與 <b>Log-Level (對數-線性)</b> 規格。
+    透過將依變數（薪資）取對數，我們可以將 $\\beta$ 係數解釋為「半彈性 (Semi-elasticity)」，即特徵每增加一單位，薪資預期變動之百分比。<br>
+    本模型特別區分了<b>投手 (Pitcher)</b> 與 <b>打者 (Hitter)</b> 市場，以排除不同守備特性造成的結構性偏差 (Structural Break)。
+    </div>
+    """, unsafe_allow_html=True)
+
+    # --- 2. 數據分群與嚴謹的特徵工程 ---
+    m_df = df.copy()
+    
+    # 側邊欄控制：模型切換與參數調整
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔬 專業模型設定")
+    m_scope = st.sidebar.radio("模型分析範圍", ["打者模型 (Hitter Model)", "投手模型 (Pitcher Model)"])
+    
+    # 變數定義：根據模型類型切換 X 變數
+    if m_scope == "打者模型 (Hitter Model)":
+        # 變數包含：產值(WAR)、生理(Age)、制度(Years)、攻擊(wRC+)、防守(Def)
+        X_vars = ['WAR', 'Age', 'Years', 'wRC+', 'Def']
+        m_df = m_df[~m_df['Position'].str.contains('P', na=False)]
+        latex_formula = r"\ln(\text{Salary}) = \beta_0 + \beta_1 \text{WAR} + \beta_2 \text{Age} + \beta_3 \text{Age}^2 + \beta_4 \text{Years} + \beta_5 \text{wRC+} + \beta_6 \text{Def} + \epsilon"
+        m_label = "Hitter"
+    else:
+        # 投手模型：排除打擊與防守指標
+        X_vars = ['WAR', 'Age', 'Years'] 
+        m_df = m_df[m_df['Position'].str.contains('P', na=False)]
+        latex_formula = r"\ln(\text{Salary}) = \beta_0 + \beta_1 \text{WAR} + \beta_2 \text{Age} + \beta_3 \text{Age}^2 + \beta_4 \text{Years} + \epsilon"
+        m_label = "Pitcher"
+
+    # 數據強制清洗 (確保數值化)
+    for c in X_vars + ['Salary_millions']:
+        m_df[c] = pd.to_numeric(m_df[c], errors='coerce')
+    m_df = m_df.dropna(subset=X_vars + ['Salary_millions'])
+
+    # 特徵轉換：Log 與 Age-Squared (巔峰效應)
+    m_df['Log_Salary'] = np.log1p(m_df['Salary_millions'].astype(float))
+    m_df['Age_Squared'] = m_df['Age'].astype(float) ** 2
+
+    # --- 3. 執行多元迴歸 (OLS) ---
+    X_matrix = m_df[X_vars + ['Age_Squared']].astype(float)
+    X_matrix = sm.add_constant(X_matrix) # 截距項
+    y_vector = m_df['Log_Salary'].astype(float)
+
+    try:
+        results = sm.OLS(y_vector, X_matrix).fit()
+
+        # --- 4. 呈現模型估計方程式 ---
+        st.write(f"#### 🎓 {m_scope}：估計方程式")
+        st.latex(latex_formula)
+
+        # --- 5. 深度分析分頁系統 ---
+        t_coef, t_diag, t_resid, t_sim = st.tabs([
+            "📋 統計係數與半彈性", "🔍 模型診斷與共線性", "🕵️ 全維度殘差異常", "🧪 薪資邊際模擬器"
+        ])
+
+        with t_coef:
+            st.subheader("迴歸係數與經濟影響力分析")
+            
+            # 建立係數表
+            summary_df = pd.DataFrame({
+                "Beta 係數": results.params,
+                "標準誤": results.bse,
+                "t 統計量": results.tvalues,
+                "P-Value": results.pvalues,
+                "邊際貢獻率 (%)": (np.exp(results.params) - 1) * 100
+            })
+            
+            # 顯著性邏輯判斷
+            def get_sig_stars(p):
+                if p < 0.01: return "★★★ (p<0.01)"
+                if p < 0.05: return "★★ (p<0.05)"
+                if p < 0.1: return "★ (p<0.1)"
+                return "n.s. (不具統計顯著性)"
+            summary_results = summary_df.copy()
+            summary_results['顯著性標記'] = summary_results['P-Value'].apply(get_sig_stars)
+            
+            st.markdown("**註：邊際貢獻率為該特徵增加一單位時，預期薪資變動之百分比。**")
+            st.dataframe(summary_results.style.format({
+                "Beta 係數": "{:.4f}",
+                "標準誤": "{:.4f}",
+                "t 統計量": "{:.2f}",
+                "P-Value": "{:.4f}",
+                "邊際貢獻率 (%)": "{:.1f}%"
+            }), use_container_width=True)
+
+            col_met1, col_met2, col_met3 = st.columns(3)
+            col_met1.metric("解釋力 R-squared", f"{results.rsquared:.4f}")
+            col_met2.metric("調整後 R²", f"{results.rsquared_adj:.3f}")
+            col_met3.metric("樣本規模 (N)", len(m_df))
+
+        with t_diag:
+            st.subheader("模型診斷與穩健性檢查")
+            col_v1, col_v2 = st.columns(2)
+            
+            with col_v1:
+                # 執行 VIF 共線性檢定 (確保變數無重疊)
+                st.write("**變數膨脹因子 (VIF) 檢定**")
+                from statsmodels.stats.outliers_influence import variance_inflation_factor
+                vif_data = pd.DataFrame()
+                vif_data["變數"] = X_matrix.columns
+                vif_data["VIF 指數"] = [variance_inflation_factor(X_matrix.values, i) for i in range(len(X_matrix.columns))]
+                st.dataframe(vif_data.round(2), hide_index=True)
+                st.caption("註：Age 與 Age² 之間具備結構性共線性，VIF > 10 為預期內正常現象。")
+
+            with col_v2:
+                # 殘差常態性診斷
+                fig_hist = px.histogram(results.resid, nbins=30, title="殘差分佈圖 (Residual Normality)",
+                                         labels={'value': '殘差值'}, color_discrete_sequence=['#1e3a8a'])
+                st.plotly_chart(fig_hist, use_container_width=True)
+                
+
+        with t_resid:
+            st.subheader("全維度市場異常偵測 (2.0)")
+            st.markdown("當我們考慮了年齡、年資與守備位置後，仍無法被模型解釋的殘差部分即為「定價偏差」。")
+            
+            # 預測值還原 (Antilog)
+            m_df['Predicted_Salary'] = np.expm1(results.fittedvalues.astype(float))
+            m_df['Ultimate_Residual'] = m_df['Salary_millions'] - m_df['Predicted_Salary']
+            
+            fig_res = px.scatter(m_df, x='Predicted_Salary', y='Salary_millions', 
+                                 hover_name='Name', color='Ultimate_Residual',
+                                 color_continuous_scale='RdBu_r',
+                                 labels={'Predicted_Salary': '模型預估身價 (M$)', 'Salary_millions': '實際薪資 (M$)'},
+                                 title=f"{m_scope}：預期 vs 實際薪資分佈")
+            
+            # 繪製 45 度理想對角線
+            diag_max = max(m_df['Salary_millions'].max(), m_df['Predicted_Salary'].max())
+            fig_res.add_trace(go.Scatter(x=[0, diag_max], y=[0, diag_max], mode='lines', 
+                                         line=dict(color='black', dash='dot'), name='效率邊界'))
+            st.plotly_chart(fig_res, use_container_width=True)
+
+            col_res1, col_res2 = st.columns(2)
+            with col_res1:
+                st.success("💎 **真正被低估球員 (低於預期身價)**")
+                st.dataframe(m_df.nsmallest(15, 'Ultimate_Residual')[['Name', 'WAR', 'Salary_millions', 'Predicted_Salary']].round(2), hide_index=True)
+            with col_res2:
+                st.error("⚠️ **真正溢價合約 (高於預期身價)**")
+                st.dataframe(m_df.nlargest(15, 'Ultimate_Residual')[['Name', 'WAR', 'Salary_millions', 'Predicted_Salary']].round(2), hide_index=True)
+
+        with t_sim:
+            st.subheader("🧪 邊際經濟價值模擬器")
+            st.write("設定球員特徵參數，推算在當前市場結構下的「合理年度定價」：")
+            
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                s_war = st.slider("球員戰力 (WAR)", -2.0, 10.0, 4.0)
+                s_age = st.slider("球員年齡", 20, 45, 27)
+            with sc2:
+                s_years = st.slider("剩餘合約/年資 (Years)", 1, 13, 6)
+                if m_label == "Hitter":
+                    s_wrc = st.slider("進攻貢獻 (wRC+)", 50, 200, 110)
+                else:
+                    s_wrc = 0
+
+            # 計算預測薪資 (Log 空間相加再還原)
+            sim_log_p = (results.params['const'] + 
+                         results.params['WAR'] * s_war + 
+                         results.params['Age'] * s_age + 
+                         results.params['Age_Squared'] * (s_age**2) + 
+                         results.params['Years'] * s_years)
+            if 'wRC+' in results.params: sim_log_p += results.params['wRC+'] * s_wrc
+            
+            sim_final = np.expm1(sim_log_p)
+            
+            st.markdown(f"""
+            <div style="text-align: center; background-color: #f1f5f9; padding: 30px; border-radius: 20px; border: 3px solid #1E3A8A;">
+                <p style="color: #64748b; font-size: 1.2rem; margin-bottom: 0;">此特徵組合下之「理想年度薪資」預測</p>
+                <h1 style="font-size: 4rem; color: #1e40af; margin: 10px 0;">${sim_final:.2f} M</h1>
+                <p style="color: #94a3b8;">(已根據市場生理曲線、年資紅利與戰力指標進行動態校正)</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    except Exception as e:
+        st.error(f"模型運算錯誤。這通常是因為特定子群組資料量不足或共線性過強導致矩陣奇異。")
+        st.info(f"詳細錯誤訊息: {e}")
+        
 elif analysis_mode == "球員搜尋":
     st.markdown('<h2 class="section-title">球員搜尋與比較</h2>', unsafe_allow_html=True)
     
@@ -1092,63 +1265,39 @@ elif analysis_mode == "球員搜尋":
                     if len(selected_players) >= 2:
                         st.markdown("#### 比較圖表")
                         
-                        # 雷達圖比較
+                        # 新增：雷達圖比較
                         st.markdown("**能力值比較 (PR值雷達圖)**")
                         fig_radar = plot_player_radar(df, selected_players)
                         if fig_radar:
-                            st.plotly_chart(fig_radar, use_container_width=True)
-                    
-                        # 修改後的柱狀圖 - 每個球員兩根獨立柱子
-                        st.markdown("**數值直接比較 (薪資 vs WAR)**")
-                        
-                        # 準備數據
-                        compare_df_sorted = compare_df.sort_values('WAR', ascending=False)
-                        player_names = compare_df_sorted['Name'].tolist()
-                        
-                        # 創建圖表
+                            st.plotly_chart(fig_radar, use_container_width=True)  # 保留原始參數
+
+                        # 原有的柱狀圖
+                        st.markdown("**數值直接比較**")
                         fig = go.Figure()
                         
-                        # 為每個球員添加兩根柱子
-                        for i, player in enumerate(player_names):
-                            player_data = compare_df_sorted[compare_df_sorted['Name'] == player].iloc[0]
-                            
-                            fig.add_trace(go.Bar(
-                                name='WAR',
-                                x=player_names,  # 只用球員姓名
-                                y=compare_df_sorted['WAR'],
-                                marker_color='#1f77b4',
-                                offsetgroup=0,  # 第一個群組
-                            ))
-                            
-                            # 薪資柱子（整個群組的右側）
-                            fig.add_trace(go.Bar(
-                                name='薪資 (M)',
-                                x=player_names,  # 同一個 x 軸
-                                y=compare_df_sorted['Salary_millions'],
-                                marker_color='#2ca02c',
-                                offsetgroup=1,  # 第二個群組
-                            ))
+                        fig.add_trace(go.Bar(
+                            x=compare_df['Name'],
+                            y=compare_df['WAR'],
+                            name='WAR',
+                            marker_color='blue'
+                        ))
                         
-                        # 更新版面配置
+                        fig.add_trace(go.Bar(
+                            x=compare_df['Name'],
+                            y=compare_df['Salary_millions'],
+                            name='薪資 (M)',
+                            marker_color='green',
+                            yaxis='y2'
+                        ))
+                        
                         fig.update_layout(
                             title='球員WAR與薪資比較',
-                            xaxis_title='球員',
-                            yaxis_title='數值',
-                            barmode='group',  # 群組模式
-                            bargap=0.3,  # 群組間的間距
-                            bargroupgap=0.1,  # 群組內柱子間距
-                            height=500,
-                            xaxis_tickangle=-45,  # 旋轉標籤避免重疊
-                            legend=dict(
-                                orientation="h",
-                                yanchor="bottom",
-                                y=1.02,
-                                xanchor="right",
-                                x=1
-                            )
+                            yaxis=dict(title='WAR'),
+                            yaxis2=dict(title='薪資 (百萬美元)', overlaying='y', side='right'),
+                            barmode='group'
                         )
                         
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
 
 elif analysis_mode == "球隊分析":
     st.markdown('<h2 class="section-title">球隊分析</h2>', unsafe_allow_html=True)
@@ -1159,11 +1308,13 @@ elif analysis_mode == "球隊分析":
         1. **球隊選擇**：選擇要分析的球隊（可多選）
         2. **效率排名**：比較不同球隊的薪資使用效率
         3. **詳細統計**：查看每支球隊的詳細數據
+        4. **投資組合夏普指數 (PSI)**：衡量球隊風險調整後的績效表現
         
         ### 關鍵指標
         - **總WAR**：球隊所有球員的WAR總和
         - **總薪資**：球隊薪資支出總額
         - **效率**：每百萬美元薪資能獲得的WAR
+        - **PSI**：投資組合夏普指數，衡量風險調整後的超額績效
         """)
     
     if 'Team' in df.columns:
@@ -1628,236 +1779,136 @@ elif analysis_mode == "球隊分析":
                     st.warning("所選球隊數據不足，無法計算PSI")
 
 elif analysis_mode == "市場異常偵測":
-    st.markdown('<h2 class="section-title">市場異常偵測</h2>', unsafe_allow_html=True)
+    st.markdown('<h2 class="section-title">🕵️ 市場異常偵測：一維產值 vs. 全維度定價對照</h2>', unsafe_allow_html=True)
     
     with st.expander("使用說明", expanded=True):
         st.markdown("""
         ### 功能介紹
-        1. **異常偵測**：基於回歸分析識別被高估/低估的球員
-        2. **閾值調整**：可調整異常值的敏感度
-        3. **詳細分析**：查看每位異常球員的詳細分析
-        
-        ### 分析方法
-        - 使用線性回歸建立WAR與薪資的關係模型
-        - 計算每位球員的預期薪資
-        - 比較實際薪資與預期薪資的差異
-        - 識別差異超過閾值的球員為異常值
+        1. **異常偵測**：識別實際薪資偏離模型預期身價的球員。
+        2. **模型切換**：可選擇 **[單一戰力曲線]** 或 **[全維度計量模型]**。
+        3. **MERI 指標**：透過戰力加權殘差，判斷定價偏離的嚴重性。
         """)
-    
+
+    # --- 1. 偵測與模型設定 (保留所有原始 Slider) ---
     if 'WAR' in df.columns and 'Salary_millions' in df.columns:
-        # 設定底薪門檻（排除還在領底薪的球員）
-        min_salary_threshold = 1.0  # 100萬美元以下視為底薪
+        min_salary_threshold = 1.0  
+        st.markdown("### ⚙️ 偵測與模型設定")
         
-        # 只使用薪資高於門檻的球員來建立回歸模型
-        df_model = df[df['Salary_millions'] > min_salary_threshold].dropna(subset=['WAR', 'Salary_millions']).copy()
+        col_m1, col_m2 = st.columns([2, 1])
+        with col_m1:
+            poly_degree = st.slider("1. WAR 曲線擬合次方數 (對照組)", 1, 8, 3)
+        with col_m2:
+            threshold = st.slider("異常值判定閾值 (%)", 10, 100, 30, step=5)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            min_val = float(df['WAR'].min())
+            max_val = float(df['WAR'].max())
+            min_war = st.slider("最小WAR要求", min_val, max_val, 1.0)
+        with col2:
+            exclude_rookies = st.checkbox("排除底薪球員 (< $1M)", value=True)
+
+        analysis_focus = st.radio("選擇身價判定邏輯", ["單一 WAR 曲線", "全維度計量模型"], horizontal=True)
+
+        # --- 2. 核心計算區：兩套模型並行 ---
+        # 模型 A：原本的多項式回歸 (你的邏輯)
+        df_model_simple = df[df['Salary_millions'] > min_salary_threshold].dropna(subset=['WAR', 'Salary_millions']).copy()
+        coeffs_s = np.polyfit(df_model_simple['WAR'].values, df_model_simple['Salary_millions'].values, poly_degree)
+        p_simple = np.poly1d(coeffs_s)
         
-        if len(df_model) < 10:
-            st.warning(f"⚠️ 薪資高於 ${min_salary_threshold}M 的球員樣本不足 ({len(df_model)} 位)，無法建立可靠的回歸模型")
-            st.stop()
-        
-        # 計算預期薪資（使用高於底薪的球員建立模型）
-        X = df_model[['WAR']].values
-        y = df_model['Salary_millions'].values
-        
-        A = np.vstack([X.flatten(), np.ones(len(X))]).T
-        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
-        
-        # 為所有球員計算預期薪資
-        df_clean = df.dropna(subset=['WAR', 'Salary_millions']).copy()
-        df_clean['expected_salary'] = slope * df_clean['WAR'] + intercept
+        # 模型 B：全維度多元回歸 (計量引擎)
+        m_scope = "Hitter" if (~df['Position'].str.contains('P', na=False)).sum() > df['Position'].str.contains('P', na=False).sum() else "Pitcher"
+        X_vars = ['WAR', 'Age', 'Years', 'wRC+', 'Def'] if m_scope == "Hitter" else ['WAR', 'Age', 'Years']
+            
+        df_model_multi = df.dropna(subset=X_vars + ['Salary_millions']).copy()
+        df_model_multi['Log_Salary'] = np.log1p(df_model_multi['Salary_millions'].astype(float))
+        df_model_multi['Age_Squared'] = df_model_multi['Age']**2
+        X_m = sm.add_constant(df_model_multi[X_vars + ['Age_Squared']].astype(float))
+        res_multi = sm.OLS(df_model_multi['Log_Salary'], X_m).fit()
+
+        # --- 3. 應用基準與計算 ---
+        df_clean = df.dropna(subset=['WAR', 'Salary_millions', 'Age', 'Years']).copy()
+        df_clean['Age_Squared'] = df_clean['Age']**2
+
+        if "單一 WAR" in analysis_focus:
+            df_clean['expected_salary'] = np.maximum(p_simple(df_clean['WAR']), 0.7)
+        else:
+            X_pred = sm.add_constant(df_clean[X_vars + ['Age_Squared']].astype(float))
+            df_clean['expected_salary'] = np.expm1(res_multi.predict(X_pred))
+
         df_clean['salary_residual'] = df_clean['Salary_millions'] - df_clean['expected_salary']
         df_clean['residual_percent'] = (df_clean['salary_residual'] / df_clean['expected_salary']) * 100
-        
-        # 合併回原 DataFrame
-        df = df.merge(
-            df_clean[['expected_salary', 'salary_residual', 'residual_percent']], 
-            left_index=True, 
-            right_index=True, 
-            how='left'
-        )
-        
-        # 閾值設定
-        st.markdown("### 偵測設定")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            threshold = st.slider(
-                "異常值閾值 (%)", 
-                10, 50, 30,
-                help="設定差異百分比閾值，值越高表示越嚴格的偵測標準"
-            )
-        
-        with col2:
-            min_war = st.slider(
-                "最小WAR要求",
-                0.0, float(df['WAR'].max()), 1.0,
-                help="只分析WAR高於此值的球員，避免極端小樣本影響"
-            )
-        
-        with col3:
-            exclude_rookies = st.checkbox(
-                "排除底薪球員 (< $1M)",
-                value=True,
-                help="排除還在領底薪的年輕球員，避免制度性低估"
-            )
-        
-        # 篩選數據
-        analysis_df = df[df['WAR'] >= min_war].copy()
-        
+        df_clean['MERI'] = (df_clean['salary_residual'] / df_clean['expected_salary']) * np.log(1 + np.abs(df_clean['WAR']))
+
+        # --- 4. 顯示模型詳細資訊 (Beta 公式化) ---
+        with st.expander("📝 當前模型估計方程式與變數解釋", expanded=True):
+            if "單一 WAR" in analysis_focus:
+                eq_str = format_poly_equation(coeffs_s, 'WAR')
+                st.write("**單一維度產值定價公式：**")
+                st.latex(rf"\widehat{{\text{{Salary}}}} = {eq_str}")
+            else:
+                # 提取 Beta 並動態生成 LaTeX 公式
+                b = res_multi.params
+                if m_scope == "Hitter":
+                    formula = (rf"\ln(\text{{Salary}}) = {b['const']:.3f} + {b['WAR']:.3f}(\text{{WAR}}) + {b['Age']:.3f}(\text{{Age}}) "
+                               rf"+ {b['Age_Squared']:.4f}(\text{{Age}}^2) + {b['Years']:.3f}(\text{{Years}}) "
+                               rf"+ {b['wRC+']:.4f}(\text{{wRC+}}) + {b['Def']:.3f}(\text{{Def}})")
+                else:
+                    formula = (rf"\ln(\text{{Salary}}) = {b['const']:.3f} + {b['WAR']:.3f}(\text{{WAR}}) + {b['Age']:.3f}(\text{{Age}}) "
+                               rf"+ {b['Age_Squared']:.4f}(\text{{Age}}^2) + {b['Years']:.3f}(\text{{Years}})")
+                
+                st.write("**全維度計量定價公式 (Log-Level)：**")
+                st.latex(formula)
+                
+                st.markdown("---")
+                st.markdown("**變數中文翻譯與經濟意義：**")
+                cols = st.columns(2)
+                with cols[0]:
+                    st.write("- **WAR (勝場貢獻值)**: 球員相較於替補球員為球隊多贏得的勝場。")
+                    st.write("- **Age (年齡)**: 球員的生理年齡。")
+                    st.write("- **Age² (年齡平方)**: 用於捕捉生理巔峰後的報酬遞減（折舊）效應。")
+                with cols[1]:
+                    st.write("- **Years (合約/年資)**: 合約保障年限或服務年資。")
+                    if m_scope == "Hitter":
+                        st.write("- **wRC+ (加權得分創造)**: 修正後的攻擊效率（100為聯盟平均）。")
+                        st.write("- **Def (防守貢獻)**: 球員在場上相較於平均水準的防守產值。")
+
+        # --- 5. 異常名單排行榜 (維持原始格式) ---
+        analysis_df = df_clean[df_clean['WAR'] >= min_war].copy()
         if exclude_rookies:
             analysis_df = analysis_df[analysis_df['Salary_millions'] >= min_salary_threshold]
-            st.info(f"🔍 已排除底薪球員，分析 {len(analysis_df)} 位薪資高於 ${min_salary_threshold}M 的球員")
         
-        # 確保需要的欄位存在且為數值型別
-        for col in ['expected_salary', 'salary_residual', 'residual_percent']:
-            if col in analysis_df.columns:
-                analysis_df[col] = pd.to_numeric(analysis_df[col], errors='coerce')
+        undervalued = analysis_df[analysis_df['residual_percent'] < -threshold].sort_values('MERI')
+        overvalued = analysis_df[analysis_df['residual_percent'] > threshold].sort_values('MERI', ascending=False)
         
-        # 識別異常值
-        undervalued = analysis_df[analysis_df['residual_percent'] < -threshold].sort_values('residual_percent')
-        overvalued = analysis_df[analysis_df['residual_percent'] > threshold].sort_values('residual_percent', ascending=False)
+        st.markdown("### 🏆 市場定價異常排行榜 (按 MERI 排序)")
+        col_tab1, col_tab2 = st.columns(2)
         
-        # 顯示結果摘要
-        st.markdown("### 偵測結果")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("分析球員數", len(analysis_df))
-        
-        with col2:
-            st.metric("被低估球員", len(undervalued))
-        
-        with col3:
-            st.metric("被高估球員", len(overvalued))
-        
-        # 顯示模型資訊
-        with st.expander("回歸模型資訊", expanded=False):
-            st.markdown(f"""
-            **模型建立基礎**：{len(df_model)} 位薪資高於 ${min_salary_threshold}M 的球員
-            
-            **回歸方程式**：`預期薪資 = {slope:.3f} × WAR + {intercept:.3f}`
-            
-            **每 1 WAR 價值**：${slope:.2f}M
-            
-            **基礎薪資**：${intercept:.2f}M
-            
-            **決定係數 R²**：{np.corrcoef(df_model['WAR'], df_model['Salary_millions'])[0,1]**2:.3f}
-            """)
-        
-        # 詳細結果
-        col1, col2 = st.columns(2)
+        for data_group, col, title, label in zip([undervalued, overvalued], [col_tab1, col_tab2], 
+                                                ["💎 高性價比名單 (低於預期身價)", "⚠️ 溢價合約名單 (高於預期身價)"],
+                                                ["download_under", "download_over"]):
+            with col:
+                st.markdown(title)
+                if len(data_group) > 0:
+                    display_df = data_group.head(20).copy()
+                    display_df = display_df[['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent', 'MERI']]
+                    display_df.columns = ['姓名', '球隊', 'WAR', '實際薪資(M)', '預期薪資(M)', '差異%', 'MERI 指標']
+                    st.dataframe(display_df.round(3), use_container_width=True, hide_index=True)
+                    csv = display_df.to_csv(index=False)
+                    st.download_button(label=f"📥 下載名單", data=csv, file_name=f"{label}.csv", mime="text/csv", key=label)
+                else:
+                    st.info("未發現符合條件的球員")
 
-        with col1:
-            st.markdown(f"#### 被低估球員 (< -{threshold}%)")
-            
-            if len(undervalued) > 0:
-                # 準備要顯示的欄位
-                undervalued_display = undervalued.head(20).copy()
-                
-                # 確保預期薪資欄位存在
-                if 'expected_salary' not in undervalued_display.columns:
-                    undervalued_display['expected_salary'] = slope * undervalued_display['WAR'] + intercept
-                
-                if 'residual_percent' not in undervalued_display.columns:
-                    undervalued_display['residual_percent'] = ((undervalued_display['Salary_millions'] - undervalued_display['expected_salary']) / undervalued_display['expected_salary']) * 100
-                
-                # 選擇要顯示的欄位（強制包含預期薪資）
-                display_columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
-                undervalued_display = undervalued_display[display_columns].copy()
-                
-                # 確保數值欄位是數值型別
-                undervalued_display['WAR'] = pd.to_numeric(undervalued_display['WAR'], errors='coerce')
-                undervalued_display['Salary_millions'] = pd.to_numeric(undervalued_display['Salary_millions'], errors='coerce')
-                undervalued_display['expected_salary'] = pd.to_numeric(undervalued_display['expected_salary'], errors='coerce')
-                undervalued_display['residual_percent'] = pd.to_numeric(undervalued_display['residual_percent'], errors='coerce')
-                
-                # 格式化數值
-                undervalued_display['WAR'] = undervalued_display['WAR'].round(2)
-                undervalued_display['Salary_millions'] = undervalued_display['Salary_millions'].round(2)
-                undervalued_display['expected_salary'] = undervalued_display['expected_salary'].round(2)
-                undervalued_display['residual_percent'] = undervalued_display['residual_percent'].round(1)
-                
-                # 重新命名欄位為中文
-                undervalued_display.columns = ['姓名', '球隊', 'WAR', '實際薪資(M)', '預期薪資(M)', '差異%']
-                
-                # 顯示表格
-                st.dataframe(
-                    undervalued_display,
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # 下載按鈕
-                download_df = undervalued_display.copy()
-                download_df.columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
-                csv1 = download_df.to_csv(index=False)
-                st.download_button(
-                    label="📥 下載被低估球員名單",
-                    data=csv1,
-                    file_name=f"undervalued_players_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="download_undervalued"
-                )
-            else:
-                st.info("未發現被低估的球員")
+    # --- 6. 殘差分布視覺化 ---
+    st.markdown("### 殘差分佈診斷 (Residual Diagnostics)")
+    fig_res = px.scatter(analysis_df, x='expected_salary', y='Salary_millions', 
+                         hover_name='Name', color='MERI', color_continuous_scale='RdBu_r',
+                         title="預期身價 vs. 實際薪資 (顏色代表 MERI 強度)")
+    fig_res.add_trace(go.Scatter(x=[0, analysis_df['Salary_millions'].max()], 
+                                 y=[0, analysis_df['Salary_millions'].max()], 
+                                 mode='lines', line=dict(color='black', dash='dot'), name='效率線'))
+    st.plotly_chart(fig_res, use_container_width=True)
 
-        with col2:
-            st.markdown(f"#### 被高估球員 (> {threshold}%)")
-            
-            if len(overvalued) > 0:
-                # 準備要顯示的欄位
-                overvalued_display = overvalued.head(20).copy()
-                
-                # 確保預期薪資欄位存在
-                if 'expected_salary' not in overvalued_display.columns:
-                    overvalued_display['expected_salary'] = slope * overvalued_display['WAR'] + intercept
-                
-                if 'residual_percent' not in overvalued_display.columns:
-                    overvalued_display['residual_percent'] = ((overvalued_display['Salary_millions'] - overvalued_display['expected_salary']) / overvalued_display['expected_salary']) * 100
-                
-                # 選擇要顯示的欄位（強制包含預期薪資）
-                display_columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
-                overvalued_display = overvalued_display[display_columns].copy()
-                
-                # 確保數值欄位是數值型別
-                overvalued_display['WAR'] = pd.to_numeric(overvalued_display['WAR'], errors='coerce')
-                overvalued_display['Salary_millions'] = pd.to_numeric(overvalued_display['Salary_millions'], errors='coerce')
-                overvalued_display['expected_salary'] = pd.to_numeric(overvalued_display['expected_salary'], errors='coerce')
-                overvalued_display['residual_percent'] = pd.to_numeric(overvalued_display['residual_percent'], errors='coerce')
-                
-                # 格式化數值
-                overvalued_display['WAR'] = overvalued_display['WAR'].round(2)
-                overvalued_display['Salary_millions'] = overvalued_display['Salary_millions'].round(2)
-                overvalued_display['expected_salary'] = overvalued_display['expected_salary'].round(2)
-                overvalued_display['residual_percent'] = overvalued_display['residual_percent'].round(1)
-                
-                # 重新命名欄位為中文
-                overvalued_display.columns = ['姓名', '球隊', 'WAR', '實際薪資(M)', '預期薪資(M)', '差異%']
-                
-                # 顯示表格
-                st.dataframe(
-                    overvalued_display,
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # 下載按鈕
-                download_df = overvalued_display.copy()
-                download_df.columns = ['Name', 'Team', 'WAR', 'Salary_millions', 'expected_salary', 'residual_percent']
-                csv2 = download_df.to_csv(index=False)
-                st.download_button(
-                    label="📥 下載被高估球員名單",
-                    data=csv2,
-                    file_name=f"overvalued_players_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="download_overvalued"
-                )
-            else:
-                st.info("未發現被高估的球員")
-
-# 新增：進階策略分析頁面
 elif analysis_mode == "進階策略分析":
     st.markdown('<h2 class="section-title">進階策略分析 (Moneyball & Arbitrage)</h2>', unsafe_allow_html=True)
     
@@ -1908,471 +1959,377 @@ elif analysis_mode == "進階策略分析":
                 )
     
     with tab2:
-        st.markdown("### 手動 OLS 回歸模型驗證")
-        st.markdown("手動計算最小平方法 (Ordinary Least Squares)，提供完整統計檢定數據。")
+        st.markdown("### 手動高次多項式迴歸驗證")
+        st.markdown("探討自變數與薪資之間的非線性結構，並提供模型整體解釋力檢定。")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             x_col = st.selectbox("選擇自變數 (X)", ['WAR', 'HR', 'RBI', 'ERA'], index=0)
         with col2:
             y_col = st.selectbox("選擇依變數 (Y)", ['Salary_millions', 'value_ratio'], index=0)
+        with col3:
+            deg = st.number_input("多項式次方", min_value=1, max_value=8, value=1)
             
         if x_col in df.columns and y_col in df.columns:
             data_reg = df[[x_col, y_col]].dropna()
             
             if len(data_reg) > 10:
-                result = manual_ols_regression(data_reg[x_col].values, data_reg[y_col].values)
+                result = manual_poly_regression_stats(data_reg[x_col].values, data_reg[y_col].values, deg)
                 
                 if result:
-                    st.markdown("#### 回歸統計結果")
+                    st.markdown("#### 迴歸統計結果")
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("R² (決定係數)", f"{result['r_squared']:.4f}")
                     c2.metric("調整後 R²", f"{result['adj_r_squared']:.4f}")
                     c3.metric("F-Statistic", f"{result['f_value']:.2f}")
                     c4.metric("樣本數 (n)", result['n'])
                     
-                    st.markdown("#### 係數表")
-                    coef_data = {
-                        "變數": ["截距 (Intercept)", f"斜率 ({x_col})"],
-                        "係數 (Coef)": [result['intercept'], result['slope']],
-                        "標準誤 (Std Err)": [result['std_err_intercept'], result['std_err_slope']],
-                        "t值 (t-stat)": [result['t_intercept'], result['t_slope']],
-                        "P值 (P>|t|)": [result['p_intercept'], result['p_slope']]
-                    }
-                    st.dataframe(pd.DataFrame(coef_data).style.format({
-                        "係數 (Coef)": "{:.4f}",
-                        "標準誤 (Std Err)": "{:.4f}",
-                        "t值 (t-stat)": "{:.2f}",
-                        "P值 (P>|t|)": "{:.4f}"
-                    }), use_container_width=True, hide_index=True)  # 保留原始參數
+                    st.markdown("#### 多項式方程式")
+                    eq_str = format_poly_equation(result['coeffs'], x_col)
+                    st.markdown(rf"$$ \widehat{{\text{{{y_col}}}}} = {eq_str} $$")
                     
-                    # 顯著性判斷
-                    if result['p_slope'] < 0.05:
-                        st.success(f"✅ 變數 **{x_col}** 對 **{y_col}** 有顯著影響 (P < 0.05)")
-                    else:
-                        st.warning(f"⚠️ 變數 **{x_col}** 對 **{y_col}** 的影響不顯著 (P >= 0.05)")
+                    # 繪製曲線
+                    fig_poly = px.scatter(data_reg, x=x_col, y=y_col, title=f'{y_col} vs {x_col} ({deg}次方擬合)')
+                    x_range = np.linspace(data_reg[x_col].min(), data_reg[x_col].max(), 100)
+                    y_pred = result['poly_obj'](x_range)
+                    fig_poly.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name='預測曲線', line=dict(color='red')))
+                    st.plotly_chart(fig_poly, use_container_width=True)
             else:
                 st.error("樣本數不足，無法進行回歸分析")
 
+# 新增：原創財務指標頁面
 elif analysis_mode == "原創財務指標":
-    st.markdown('<h2 class="section-title">原創財務指標分析</h2>', unsafe_allow_html=True)
+    st.markdown('<h2 class="section-title">🎓 原創財務指標：計量引擎與風險評價系統</h2>', unsafe_allow_html=True)
     
     st.markdown("""
     <div class="info-box">
-    <b>原創指標說明：</b> 本模組展示根據財務學概念設計的六個原創指標，用於評估MLB球員的市場價值、投資效率與風險調整後績效。
-    這些指標借鑑了資本資產定價模型(CAPM)、夏普比率、折現現金流模型、迴歸殘差分析與基尼係數。
+    <b>原創指標說明：</b> 本模組展示根據財務學概念設計的六個原創指標，用於評估 MLB 球員的市場價值、投資效率與風險調整後績效。
+    本版本已將 <b>Multivariate OLS (全維度迴歸)</b> 運算結果整合進 MERI 殘差分析中。
     </div>
     """, unsafe_allow_html=True)
+
+    # ============================================================
+    # 核心計量引擎：進入頁面即時運算 (確保數據絕對顯示)
+    # ============================================================
+    st.sidebar.markdown("---")
+    m_scope = st.sidebar.radio("🔭 指標分析基準群組", ["打者模型 (Hitter)", "投手模型 (Pitcher)"], key="om_scope_radio")
     
-    # 檢查是否有計算原創指標
-    if all(col in df.columns for col in ['WVPI', 'RAV', 'MERI']):
+    m_df = df.copy()
+    # 區分投手與打者變數
+    if m_scope == "打者模型 (Hitter)":
+        X_vars = ['WAR', 'Age', 'Years', 'wRC+', 'Def']
+        m_df = m_df[~m_df['Position'].str.contains('P', na=False)]
+    else:
+        X_vars = ['WAR', 'Age', 'Years']
+        m_df = m_df[m_df['Position'].str.contains('P', na=False)]
+
+    # 數據清洗與轉換
+    m_df[X_vars + ['Salary_millions']] = m_df[X_vars + ['Salary_millions']].apply(pd.to_numeric, errors='coerce')
+    m_df = m_df.dropna(subset=X_vars + ['Salary_millions'])
+    m_df['Age_Squared'] = m_df['Age']**2
+
+    # 執行全維度計量迴歸 (取得實測 Beta)
+    X_matrix = sm.add_constant(m_df[X_vars + ['Age_Squared']].astype(float))
+    y_log = np.log1p(m_df['Salary_millions'].astype(float))
+    res_ols = sm.OLS(y_log, X_matrix).fit()
+    b = res_ols.params # 提取 Beta 數值
+    m_df['Expected_Fair_Value'] = np.expm1(res_ols.fittedvalues) # 還原預測值
+
+    # 重新計算原創指標 (確保欄位在當前 m_df 中絕對存在)
+    m_df['MERI'] = ((m_df['Salary_millions'] - m_df['Expected_Fair_Value']) / m_df['Expected_Fair_Value']) * np.log(1 + np.abs(m_df['WAR']))
+    # --- 修正：補回 MERI 分類標籤，否則 Plotly 會報錯 ---
+    conditions = [
+        m_df['MERI'] > 0.5,
+        (m_df['MERI'] > 0.1) & (m_df['MERI'] <= 0.5),
+        (m_df['MERI'] >= -0.1) & (m_df['MERI'] <= 0.1),
+        (m_df['MERI'] >= -0.5) & (m_df['MERI'] < -0.1),
+        m_df['MERI'] < -0.5
+    ]
+    categories = ['嚴重高估', '稍微高估', '合理定價', '稍微低估', '嚴重低估']
+    m_df['MERI_category'] = np.select(conditions, categories, default='未知')
+    m_df = calculate_wvpi(m_df) # 重新調用 WVPI 計算
+    m_df = calculate_rav(m_df)  # 重新調用 RAV 計算
+
+    # ============================================================
+    # 分頁展示區域 (保留所有原始 Tab)
+    # ============================================================
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "WVPI (加權綜合價值指數)", 
+        "RAV (風險調整後價值)", 
+        "MERI (市場效率殘差指數)",
+        "TPM (雙因子績效矩陣)",
+        "PSI (投資組合夏普指數)",
+        "SEI (同步效率指數)"
+    ])
+    
+    with tab1:
+        st.markdown("### 加權綜合價值指數 (WVPI)")
+        st.markdown(r"$$ \text{WVPI} = w_1 \text{WAR} + w_2 \frac{\text{WAR}}{\text{Salary}} + w_3 P_{\text{WAR}} + w_4 (100 - P_{\text{Salary}}) $$")
         
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "WVPI (加權綜合價值指數)", 
-            "RAV (風險調整後價值)", 
-            "MERI (市場效率殘差指數)",
-            "TPM (雙因子績效矩陣)",
-            "PSI (投資組合夏普指數)",
-            "SEI (同步效率指數)"
-        ])
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        comp_cols = ['WAR_norm', 'VR_norm', 'P_WAR', 'P_Salary_inv']
+        comp_names = ['絕對表現(WAR)', '效率(VR)', '相對表現(P_WAR)', '相對成本(P_Salary)']
         
-        with tab1:
-            st.markdown("### 加權綜合價值指數 (WVPI)")
-            st.markdown(r"""
-            **WVPI** 是一個多維度的球員評估指標，結合了絕對表現、效率、相對排名與成本效益。
+        if all(col in m_df.columns for col in comp_cols):
+            df_v = m_df.dropna(subset=comp_cols + ['Name', 'Team']).copy()
+            scaler = StandardScaler()
+            pca = PCA().fit(scaler.fit_transform(df_v[comp_cols]))
+            pca_weights = np.abs(pca.components_[0]) / np.sum(np.abs(pca.components_[0]))
+            df_v['WVPI_PCA'] = (pca_weights[0]*df_v['WAR_norm'] + pca_weights[1]*df_v['VR_norm'] + 
+                                pca_weights[2]*df_v['P_WAR'] + pca_weights[3]*df_v['P_Salary_inv'])
             
-            $$ \text{WVPI} = w_1 \times \text{WAR} + w_2 \times \frac{\text{WAR}}{\text{Salary}} + w_3 \times P_{\text{WAR}} + w_4 \times (100 - P_{\text{Salary}}) $$
-            
-            **本研究權重設定**: $w_1=0.35$ (絕對表現), $w_2=0.30$ (效率), $w_3=0.20$ (相對表現), $w_4=0.15$ (相對成本)
-            """)
-            
-            # --- 提前計算 PCA 客觀權重與分數 ---
-            from sklearn.decomposition import PCA
-            from sklearn.preprocessing import StandardScaler
-            
-            comp_cols = ['WAR_norm', 'VR_norm', 'P_WAR', 'P_Salary_inv']
-            comp_names = ['絕對表現(WAR)', '效率(VR)', '相對表現(P_WAR)', '相對成本(P_Salary)']
-            
-            if all(col in df.columns for col in comp_cols):
-                # 用乾淨的資料訓練 PCA
-                df_valid = df.dropna(subset=comp_cols + ['Name', 'Team']).copy()
-                data = df_valid[comp_cols]
-                
-                scaler = StandardScaler()
-                scaled_data = scaler.fit_transform(data)
-                
-                pca = PCA()
-                pca.fit(scaled_data)
-                
-                loadings = np.abs(pca.components_[0])
-                pca_weights = loadings / np.sum(loadings)
-                original_weights = np.array([0.35, 0.30, 0.20, 0.15])
-                correlation = np.corrcoef(original_weights, pca_weights)[0, 1]
-                
-                # 計算全聯盟的 PCA 客觀分數
-                df['WVPI_PCA'] = (
-                    pca_weights[0] * df['WAR_norm'] + 
-                    pca_weights[1] * df['VR_norm'] + 
-                    pca_weights[2] * df['P_WAR'] + 
-                    pca_weights[3] * df['P_Salary_inv']
-                )
-                df_valid['WVPI_PCA'] = df['WVPI_PCA'] 
-            else:
-                pca_weights = None
-            
-            # 使用子分頁(Sub-tabs)來整理 WVPI 的內容
             wvpi_tab1, wvpi_tab2 = st.tabs(["📊 績效與排名分析", "⚖️ 權重設定客觀驗證 (PCA)"])
-            
             with wvpi_tab1:
-                # 【新增】並排顯示兩個排行榜
-                col_table1, col_table2 = st.columns(2)
+                c_t1, c_t2 = st.columns(2)
+                with c_t1:
+                    st.markdown("#### 🏆 原創 WVPI 最高球員")
+                    st.dataframe(m_df.nlargest(20, 'WVPI')[['Name', 'Team', 'WAR', 'Salary_millions', 'WVPI']].round(2), use_container_width=True, hide_index=True)
+                with c_t2:
+                    st.markdown("#### 🤖 PCA 基準最高球員")
+                    st.dataframe(df_v.nlargest(20, 'WVPI_PCA')[['Name', 'Team', 'WAR', 'Salary_millions', 'WVPI_PCA']].round(2), use_container_width=True, hide_index=True)
                 
-                with col_table1:
-                    st.markdown("#### 🏆 原創 WVPI 最高球員 (前20名)")
-                    top_wvpi = df.nlargest(20, 'WVPI')[['Name', 'Team', 'Position', 'WAR', 'Salary_millions', 'WVPI']]
-                    top_wvpi['排名'] = range(1, 21)
-                    # 四捨五入方便閱讀
-                    top_wvpi['WVPI'] = top_wvpi['WVPI'].round(2)
-                    st.dataframe(top_wvpi[['排名', 'Name', 'Team', 'WAR', 'Salary_millions', 'WVPI']], use_container_width=True, hide_index=True)
-                
-                with col_table2:
-                    if pca_weights is not None:
-                        st.markdown("#### 🤖 PCA 基準最高球員 (前20名)")
-                        top_pca = df.nlargest(20, 'WVPI_PCA')[['Name', 'Team', 'Position', 'WAR', 'Salary_millions', 'WVPI_PCA']]
-                        top_pca['排名'] = range(1, 21)
-                        # 四捨五入方便閱讀
-                        top_pca['WVPI_PCA'] = top_pca['WVPI_PCA'].round(2)
-                        st.dataframe(top_pca[['排名', 'Name', 'Team', 'WAR', 'Salary_millions', 'WVPI_PCA']], use_container_width=True, hide_index=True)
-                    else:
-                        st.warning("無法計算 PCA 分數，請確認資料預處理。")
-                
-                st.markdown("---")
-                
-                # 【調整】把圖表和分類統計放到排行榜下方
-                col_chart, col_stat = st.columns([2, 1])
-                
-                with col_chart:
-                    fig = px.histogram(
-                        df, x='WVPI', color='WVPI_category', nbins=40,
-                        title='原創 WVPI 分布與分類', labels={'WVPI': '加權綜合價值指數'}
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col_stat:
-                    st.markdown("#### WVPI 分類解讀")
-                    st.metric("🌟 頂級球星", len(df[df['WVPI_category'] == '頂級球星']))
-                    st.metric("🔥 優質球員", len(df[df['WVPI_category'] == '優質球員']))
-                    st.metric("👍 普通球員", len(df[df['WVPI_category'] == '普通球員']))
-                    st.metric("⚠️ 效率待提升", len(df[df['WVPI_category'] == '效率待提升']))
-                    st.metric("📉 問題合約", len(df[df['WVPI_category'] == '問題合約']))
-
+                c_ch, c_st = st.columns([2, 1])
+                with c_ch:
+                    st.plotly_chart(px.histogram(m_df, x='WVPI', color='WVPI_category', nbins=40, title='WVPI 分佈與分類'), use_container_width=True)
+                with c_st:
+                    st.markdown("#### WVPI 分類統計")
+                    for cat in ['頂級球星', '優質球員', '普通球員', '效率待提升', '問題合約']:
+                        st.metric(cat, len(m_df[m_df['WVPI_category'] == cat]))
+            
             with wvpi_tab2:
-                if pca_weights is not None:
-                    st.markdown("#### WVPI 權重設定與 PCA 客觀驗證")
-                    st.info("本區塊運用主成分分析 (PCA)，萃取數據的自然最大變異方向作為「純客觀基準權重」。藉由比較我們基於財務邏輯「主觀設定」的權重與 PCA「客觀計算」的差異，檢驗本指標的合理性。")
-                    
-                    col_w1, col_w2 = st.columns([1, 2])
-                    
-                    with col_w1:
-                        st.markdown("##### 權重配置對比")
-                        compare_text = "| 評估維度 | 原創設定 | PCA客觀 |\n| :--- | :---: | :---: |\n"
-                        for name, orig, pca_w in zip(comp_names, original_weights, pca_weights):
-                            compare_text += f"| **{name}** | {orig*100:.1f}% | {pca_w*100:.1f}% |\n"
-                        st.markdown(compare_text)
-                        
-                        st.metric("兩組權重相似度 (Pearson)", f"{correlation*100:.1f}%")
-                        if correlation > 0.8:
-                            st.success("✅ 原創設定與數據自然特徵高度吻合。")
-                        else:
-                            st.warning("⚠️ 原創設定刻意偏離自然特徵，強調了性價比邏輯。")
+                st.info("比較主觀財務權重與 PCA 客觀權重的吻合度。")
+                cw1, cw2 = st.columns([1, 2])
+                with cw1:
+                    orig_w = [0.35, 0.30, 0.20, 0.15]
+                    compare_df = pd.DataFrame({"維度": comp_names, "原創設定": orig_w, "PCA客觀": pca_weights})
+                    st.table(compare_df.style.format({"原創設定": "{:.1%}", "PCA客觀": "{:.1%}"}))
+                with cw2:
+                    st.plotly_chart(px.scatter(df_v, x='WVPI_PCA', y='WVPI', hover_name='Name', color='WAR', title="兩種評分系統對比"), use_container_width=True)
 
-                    with col_w2:
-                        fig_scatter = px.scatter(
-                            df_valid, x='WVPI_PCA', y='WVPI', hover_name='Name',
-                            hover_data=['Team', 'WAR', 'Salary_millions'],
-                            labels={'WVPI_PCA': 'PCA純數據驅動分數', 'WVPI': '原創財務邏輯分數 (WVPI)'},
-                            title="全聯盟球員：兩種評分系統散點對比",
-                            color='WAR', color_continuous_scale='Viridis'
-                        )
-                        max_val = max(df_valid['WVPI'].max(), df_valid['WVPI_PCA'].max())
-                        fig_scatter.add_shape(type="line", x0=0, y0=0, x1=max_val, y1=max_val, line=dict(color="red", dash="dash"))
-                        st.plotly_chart(fig_scatter, use_container_width=True)
+    with tab2:
+        st.markdown("### 風險調整後價值 (RAV)")
+        st.latex(r"RAV = \frac{WAR - WAR_{min}}{\sigma_{WAR} + 1} \times \frac{Median(Salary)}{Salary}")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            st.markdown("#### RAV 最高球員 (前20名)")
+            st.dataframe(m_df.nlargest(20, 'RAV')[['Name', 'Team', 'Position', 'WAR', 'Salary_millions', 'RAV', 'RAV_category']].round(2), use_container_width=True, hide_index=True)
+        with col_r2:
+            st.plotly_chart(px.scatter(m_df, x='WAR', y='RAV', color='RAV_category', hover_name='Name', title='RAV vs WAR 關係圖'), use_container_width=True)
+
+    with tab3:
+        st.markdown("### 市場效率殘差指數 (MERI) - 計量引擎版")
+        
+        # --- 1. 恢復被我刪掉的原創公式說明 (理論定義) ---
+        st.markdown(r"""
+        **MERI** 是基於迴歸分析的殘差概念，加入非線性戰力權重，識別市場異常的指標。
+        
+        $$ \text{MERI}_i = \frac{\text{Salary}_i - \widehat{\text{Salary}}_i}{\widehat{\text{Salary}}_i} \times \ln(1 + |\text{WAR}_i|) $$
+        
+        *其中 $\widehat{\text{Salary}}_i$ 為模型推算之預期身價。MERI > 0：代表被高估，MERI < 0：代表被低估。*
+        """)
+
+        # --- 2. 注入計量 $\beta$ 實測方程式 (實作細節) ---
+        with st.expander("📝 檢視當前迴歸模型之 $\beta$ 參數與變數定義", expanded=False):
+            b = res_ols.params
+            if m_scope == "打者模型 (Hitter)":
+                formula = (rf"\ln(\text{{Salary}}) = {b['const']:.3f} + {b['WAR']:.3f}(\text{{WAR}}) + {b['Age']:.3f}(\text{{Age}}) "
+                           rf"- {abs(b['Age_Squared']):.4f}(\text{{Age}}^2) + {b['Years']:.3f}(\text{{Years}}) "
+                           rf"+ {b['wRC+']:.4f}(\text{{wRC+}}) - {abs(b['Def']):.3f}(\text{{Def}})")
+            else:
+                formula = (rf"\ln(\text{{Salary}}) = {b['const']:.3f} + {b['WAR']:.3f}(\text{{WAR}}) + {b['Age']:.3f}(\text{{Age}}) "
+                           rf"- {abs(b['Age_Squared']):.4f}(\text{{Age}}^2) + {b['Years']:.3f}(\text{{Years}})")
+            
+            st.write("**實測計量定價方程式：**")
+            st.latex(formula)
+            
+            st.markdown("---")
+            st.markdown("**變數中文說明與財務意義：**")
+            c_v1, c_v2 = st.columns(2)
+            with c_v1:
+                st.write("- **WAR (勝場貢獻值)**: 衡量球員相較於替補球員的「超額技術產出」。")
+                st.write("- **Age (年齡)**: 球員生理年資。")
+                st.write("- **Age² (年齡平方)**: 捕捉「生理折舊」，反映隨年齡增長而遞減的邊際報酬。")
+            with c_v2:
+                st.write("- **Years (服務年資)**: 制度保障年限，反映 MLB 薪資體系的結構性溢價。")
+                if m_scope == "打者模型 (Hitter)":
+                    st.write("- **wRC+ (加權得分創造)**: 進攻純效率指標，100 為聯盟平均。")
+                    st.write("- **Def (防守產值)**: 守備對球隊的隱性價值貢獻。")
+
+        # --- 3. 異常名單排行榜 (不准動你的欄位) ---
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.success("💎 **計量定價 - 真正低估球員 (MERI < 0)**")
+            st.dataframe(m_df.nsmallest(20, 'MERI')[['Name', 'Team', 'WAR', 'Salary_millions', 'Expected_Fair_Value', 'MERI']].round(3), use_container_width=True, hide_index=True)
+        with col_m2:
+            st.error("⚠️ **計量定價 - 真正高估球員 (MERI > 0)**")
+            st.dataframe(m_df.nlargest(20, 'MERI')[['Name', 'Team', 'WAR', 'Salary_millions', 'Expected_Fair_Value', 'MERI']].round(3), hide_index=True)
+        
+        # --- 4. 恢復分類分佈圖 ---
+        st.plotly_chart(px.histogram(m_df, x='MERI', color='MERI_category', nbins=50, title='全維度 MERI 分佈圖'), use_container_width=True)
+    
+    with tab4:
+        st.markdown("### 雙因子績效矩陣 (TPM)")
+        st.markdown("""
+        **TPM** 是一個 2×2 的分類矩陣，根據 WAR 百分位和性價比百分位將球員分為四類。
+        
+        | 象限 | WAR 百分位 | 性價比百分位 | 類別 |
+        | :--- | :--- | :--- | :--- |
+        | **Q1** | ≥ 50 | ≥ 50 | 明星價值 |
+        | **Q2** | ≥ 50 | < 50 | 溢價球星 |
+        | **Q3** | < 50 | ≥ 50 | 潛力新秀 |
+        | **Q4** | < 50 | < 50 | 球隊冗員 |
+        """)
+        
+        # --- 核心修正：正確接回帶有標籤的 m_df ---
+        tpm_fig, m_df = plot_tpm_matrix(m_df)
+        if tpm_fig is not None:
+            st.plotly_chart(tpm_fig, use_container_width=True)
+            
+            st.markdown("#### 各象限球員分佈統計")
+            # 確保欄位存在後進行計數
+            qc = m_df['TPM_category'].value_counts()
+            
+            cq1, cq2, cq3, cq4 = st.columns(4)
+            cq1.metric("⭐ 明星價值", qc.get('明星價值', 0))
+            cq2.metric("💰 溢價球星", qc.get('溢價球星', 0))
+            cq3.metric("🌱 潛力新秀", qc.get('潛力新秀', 0))
+            cq4.metric("📉 球隊冗員", qc.get('球隊冗員', 0))
+
+    with tab5:
+        st.markdown("### 投資組合夏普指數 (PSI)")
+        st.markdown(r"""
+        **PSI** 將球隊視為投資組合，評估風險調整後的績效表現。
+        
+        $$ \text{PSI}_t = \frac{\text{總WAR}_t - \text{總薪資}_t \times \bar{e}_{\text{league}}}{\sigma_{\text{WAR}}^{\text{team}}} $$
+        
+        其中 $\bar{e}_{\text{league}}$ 為聯盟平均效率（每百萬美元可獲得的 WAR），$\sigma_{\text{WAR}}^{\text{team}}$ 為球隊內部球員表現的標準差（代表投資風險）。
+        """)
+        
+        # 計算聯盟基準效率
+        league_eff = m_df['WAR'].sum() / m_df['Salary_millions'].sum()
+        
+        # 計算各球隊 PSI
+        t_psi_list = []
+        for team in m_df['Team'].unique():
+            td = m_df[m_df['Team'] == team]
+            if len(td) >= 3: # 至少 3 人才計算風險(標準差)
+                team_war_sum = td['WAR'].sum()
+                team_salary_sum = td['Salary_millions'].sum()
+                team_risk = td['WAR'].std()
+                
+                # 計算 PSI
+                if team_risk > 0:
+                    psi_val = (team_war_sum - (team_salary_sum * league_eff)) / team_risk
                 else:
-                    st.error("缺少計算所需的標準化變數。")
-        
-        with tab2:
-            st.markdown("### 風險調整後價值 (RAV)")
-            st.markdown("""
-            **RAV** 借鑑夏普比率，將球員的表現波動性納入評估，衡量風險調整後的超額貢獻。
-            
-            $$ \\text{RAV} = \\frac{\\text{WAR} - \\text{WAR}_{\\text{min}}}{\\sigma_{\\text{WAR}} + 1} \\times \\frac{\\text{Median}(\\text{Salary})}{\\text{Salary}} $$
-            
-            其中 $\\text{WAR}_{\\text{min}}$ 為替補球員水準，$\\sigma_{\\text{WAR}}$ 為表現標準差。
-            """)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # RAV 排名
-                st.markdown("#### RAV 最高球員 (前20名)")
-                top_rav = df.nlargest(20, 'RAV')[['Name', 'Team', 'Position', 'WAR', 'Salary_millions', 'RAV', 'RAV_category']]
-                st.dataframe(top_rav, use_container_width=True, hide_index=True)  # 保留原始參數
-            
-            with col2:
-                # RAV 分布
-                fig = px.scatter(
-                    df,
-                    x='WAR',
-                    y='RAV',
-                    color='RAV_category',
-                    hover_name='Name',
-                    title='RAV vs WAR 關係圖',
-                    labels={'WAR': '勝場貢獻值', 'RAV': '風險調整後價值'}
-                )
-                st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
-        
-        with tab3:
-            st.markdown("### 市場效率殘差指數 (MERI)")
-            st.markdown("""
-            **MERI** 基於迴歸分析的殘差概念，加入非線性權重，識別市場異常。
-            
-            $$ \\text{MERI}_i = \\frac{\\text{Salary}_i - \\widehat{\\text{Salary}}_i}{\\widehat{\\text{Salary}}_i} \\times \\ln(1 + \\text{WAR}_i) $$
-            
-            MERI > 0：被高估，MERI < 0：被低估。
-            """)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # 最被低估球員
-                st.markdown("#### 最被低估球員 (MERI < 0)")
-                undervalued_meri = df[df['MERI'] < 0].nsmallest(20, 'MERI')[['Name', 'Team', 'WAR', 'Salary_millions', 'MERI', 'MERI_category']]
-                st.dataframe(undervalued_meri, use_container_width=True, hide_index=True)  # 保留原始參數
-            
-            with col2:
-                # 最被高估球員
-                st.markdown("#### 最被高估球員 (MERI > 0)")
-                overvalued_meri = df[df['MERI'] > 0].nlargest(20, 'MERI')[['Name', 'Team', 'WAR', 'Salary_millions', 'MERI', 'MERI_category']]
-                st.dataframe(overvalued_meri, use_container_width=True, hide_index=True)  # 保留原始參數
-            
-            # MERI 分布
-            fig = px.histogram(
-                df,
-                x='MERI',
-                color='MERI_category',
-                nbins=50,
-                title='MERI 分布 (市場效率殘差)',
-                labels={'MERI': '市場效率殘差指數'}
-            )
-            st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
-        
-        with tab4:
-            st.markdown("### 雙因子績效矩陣 (TPM)")
-            st.markdown("""
-            **TPM** 是一個2×2的分類矩陣，根據WAR百分位和性價比百分位將球員分為四類。
-            
-            | 象限 | WAR百分位 | 性價比百分位 | 類別 |
-            |------|-----------|--------------|------|
-            | Q1 | ≥ 50 | ≥ 50 | 明星價值 |
-            | Q2 | ≥ 50 | < 50 | 溢價球星 |
-            | Q3 | < 50 | ≥ 50 | 潛力新秀 |
-            | Q4 | < 50 | < 50 | 球隊冗員 |
-            """)
-            
-            # 繪製 TPM 矩陣
-            tpm_fig, tpm_df = plot_tpm_matrix(df)
-            if tpm_fig is not None:
-                st.plotly_chart(tpm_fig, use_container_width=True)  # 保留原始參數
-                
-                # 顯示各象限統計
-                st.markdown("#### 各象限球員分佈")
-                quadrant_counts = tpm_df['TPM_category'].value_counts().reset_index()
-                quadrant_counts.columns = ['類別', '人數']
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    star_count = quadrant_counts[quadrant_counts['類別'] == '明星價值']['人數'].values[0] if '明星價值' in quadrant_counts['類別'].values else 0
-                    st.metric("⭐ 明星價值", star_count)
-                with col2:
-                    premium_count = quadrant_counts[quadrant_counts['類別'] == '溢價球星']['人數'].values[0] if '溢價球星' in quadrant_counts['類別'].values else 0
-                    st.metric("💰 溢價球星", premium_count)
-                with col3:
-                    rookie_count = quadrant_counts[quadrant_counts['類別'] == '潛力新秀']['人數'].values[0] if '潛力新秀' in quadrant_counts['類別'].values else 0
-                    st.metric("🌱 潛力新秀", rookie_count)
-                with col4:
-                    deadweight_count = quadrant_counts[quadrant_counts['類別'] == '球隊冗員']['人數'].values[0] if '球隊冗員' in quadrant_counts['類別'].values else 0
-                    st.metric("📉 球隊冗員", deadweight_count)
-        
-        with tab5:
-            st.markdown("### 投資組合夏普指數 (PSI)")
-            st.markdown("""
-            **PSI** 將球隊視為投資組合，評估風險調整後的績效表現。
-            
-            $$ \\text{PSI}_t = \\frac{\\text{WAR}_t^{\\text{team}} - \\text{Salary}_t^{\\text{team}} \\times \\bar{e}_{\\text{league}}}{\\sigma_{\\text{WAR}}^{\\text{team}}} $$
-            
-            其中 $\\bar{e}_{\\text{league}}$ 為聯盟平均效率，$\\sigma_{\\text{WAR}}^{\\text{team}}$ 為球隊內部風險。
-            """)
-            
-            # 計算聯盟平均效率
-            league_efficiency = df['WAR'].sum() / df['Salary_millions'].sum()
-            
-            # 計算各球隊 PSI
-            team_psi_data = []
-            for team in df['Team'].unique():
-                team_data = df[df['Team'] == team]
-                if len(team_data) >= 3:
-                    psi = calculate_team_psi(team_data, league_efficiency)
-                    team_psi_data.append({
-                        'Team': team,
-                        'PSI': psi,
-                        '總WAR': team_data['WAR'].sum(),
-                        '總薪資': team_data['Salary_millions'].sum(),
-                        '球員數': len(team_data)
-                    })
-            
-            if team_psi_data:
-                team_psi_df = pd.DataFrame(team_psi_data).sort_values('PSI', ascending=False)
-                
-                col1, col2 = st.columns([1, 1])
-                
-                with col1:
-                    st.dataframe(
-                        team_psi_df[['Team', 'PSI', '總WAR', '總薪資']].round(3),
-                        use_container_width=True,  # 保留原始參數
-                        hide_index=True
-                    )
-                
-                with col2:
-                    # PSI 分類
-                    conditions = [
-                        team_psi_df['PSI'] > 1.5,
-                        (team_psi_df['PSI'] > 0.5) & (team_psi_df['PSI'] <= 1.5),
-                        (team_psi_df['PSI'] > -0.5) & (team_psi_df['PSI'] <= 0.5),
-                        (team_psi_df['PSI'] > -1.5) & (team_psi_df['PSI'] <= -0.5),
-                        team_psi_df['PSI'] <= -1.5
-                    ]
-                    categories = ['卓越管理', '良好管理', '平庸管理', '效率不佳', '糟糕管理']
-                    team_psi_df['管理評價'] = np.select(conditions, categories, default='未知')
+                    psi_val = 0
                     
-                    eval_counts = team_psi_df['管理評價'].value_counts()
-                    fig = px.pie(
-                        values=eval_counts.values,
-                        names=eval_counts.index,
-                        title='球隊管理評價分布',
-                        hole=0.4
-                    )
-                    st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
-                
-                # PSI 排名圖
-                fig = px.bar(
-                    team_psi_df,
-                    x='Team',
-                    y='PSI',
-                    color='PSI',
-                    color_continuous_scale='RdYlGn',
-                    title='各球隊 PSI 排名',
-                    labels={'PSI': '投資組合夏普指數'}
-                )
-                fig.add_hline(y=0, line_dash="dash", line_color="gray")
-                st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
+                t_psi_list.append({
+                    'Team': team,
+                    'PSI': psi_val,
+                    '總WAR': team_war_sum,
+                    '總薪資(M)': team_salary_sum,
+                    '球隊風險(σ)': team_risk
+                })
         
-        with tab6:
-            st.markdown("### 同步效率指數 (SEI)")
+        if t_psi_list:
+            psi_results = pd.DataFrame(t_psi_list).sort_values('PSI', ascending=False)
+            
+            c_p1, c_p2 = st.columns([1, 1])
+            with c_p1:
+                st.markdown("**球隊管理效率排名**")
+                st.dataframe(psi_results[['Team', 'PSI', '總WAR', '總薪資(M)']].round(3), 
+                             use_container_width=True, hide_index=True)
+            
+            with c_p2:
+                # PSI 管理評價分類
+                def eval_psi(p):
+                    if p > 1.5: return '卓越管理'
+                    if p > 0.5: return '良好管理'
+                    if p > -0.5: return '平庸管理'
+                    return '效率不佳'
+                
+                psi_results['管理評價'] = psi_results['PSI'].apply(eval_psi)
+                eval_counts = psi_results['管理評價'].value_counts()
+                st.plotly_chart(px.pie(values=eval_counts.values, names=eval_counts.index, 
+                                       title="全聯盟管理品質分佈", hole=0.4), use_container_width=True)
+            
+            # PSI 柱狀圖
+            st.plotly_chart(px.bar(psi_results, x='Team', y='PSI', color='PSI', 
+                                   color_continuous_scale='RdYlGn', title="各球隊投資組合夏普指數排名"), 
+                            use_container_width=True)
+
+    with tab6:
+        st.markdown("### 同步效率指數 (SEI)")
+        st.markdown(r"""
+        **SEI** 結合市場相關性與分配公平性，是一個衡量整體市場健康度的宏觀指標。
+        
+        $$ \text{SEI} = \rho(\text{WAR}, \text{Salary}) \times (1 - G_{\text{Salary}}) $$
+        
+        其中 $\rho$ 為 WAR 與薪資的相關係數，$G$ 為薪資的基尼係數。
+        """)
+        
+        # 計算相關係數 (ρ)
+        corr_val = m_df['WAR'].corr(m_df['Salary_millions'])
+        
+        # 計算基尼係數 (G)
+        sal_sorted = np.sort(m_df['Salary_millions'].dropna().values)
+        n = len(sal_sorted)
+        if n > 0:
+            index = np.arange(1, n + 1)
+            gini_val = ((2 * index - n - 1) * sal_sorted).sum() / (n * sal_sorted.sum())
+        else:
+            gini_val = 0
+            
+        # 計算 SEI
+        sei_val = corr_val * (1 - gini_val)
+        
+        c_s1, c_s2, c_s3 = st.columns(3)
+        c_s1.metric("相關係數 (ρ)", f"{corr_val:.4f}")
+        c_s2.metric("基尼係數 (G)", f"{gini_val:.4f}")
+        c_s3.metric("同步效率 (SEI)", f"{sei_val:.4f}")
+        
+        st.markdown("#### 市場狀態象限分析")
+        
+        # 繪製市場狀態矩陣
+        fig_sei = go.Figure()
+        
+        # 添加象限背景顏色
+        # 左下: 混亂 (紅), 右下: 平均 (橙), 左上: 菁英 (藍), 右上: 理想 (綠)
+        fig_sei.add_shape(type="rect", x0=0, y0=0, x1=0.5, y1=0.5, fillcolor="rgba(239, 83, 80, 0.1)", line_width=0)
+        fig_sei.add_shape(type="rect", x0=0.5, y0=0, x1=1, y1=0.5, fillcolor="rgba(255, 167, 38, 0.1)", line_width=0)
+        fig_sei.add_shape(type="rect", x0=0, y0=0.5, x1=0.5, y1=1, fillcolor="rgba(66, 165, 245, 0.1)", line_width=0)
+        fig_sei.add_shape(type="rect", x0=0.5, y0=0.5, x1=1, y1=1, fillcolor="rgba(102, 187, 106, 0.1)", line_width=0)
+        
+        # 添加標籤
+        fig_sei.add_annotation(x=0.25, y=0.25, text="混亂市場", showarrow=False, font=dict(color="gray"))
+        fig_sei.add_annotation(x=0.75, y=0.25, text="平均主義", showarrow=False, font=dict(color="gray"))
+        fig_sei.add_annotation(x=0.25, y=0.75, text="菁英市場", showarrow=False, font=dict(color="gray"))
+        fig_sei.add_annotation(x=0.75, y=0.75, text="理想市場", showarrow=False, font=dict(color="gray"))
+        
+        # 標註當前位置
+        fig_sei.add_trace(go.Scatter(
+            x=[gini_val], y=[corr_val],
+            mode='markers+text',
+            marker=dict(size=25, color='red', symbol='star'),
+            text=['當前市場'], textposition='top center'
+        ))
+        
+        fig_sei.update_layout(
+            title="MLB 市場定價效率矩陣圖",
+            xaxis_title="薪資基尼係數 (G) → 不公平度",
+            yaxis_title="表現相關係數 (ρ) → 效率度",
+            xaxis_range=[0, 1], yaxis_range=[0, 1],
+            height=500, showlegend=False
+        )
+        st.plotly_chart(fig_sei, use_container_width=True)
+        
+        with st.expander("🎓 市場狀態學術解讀"):
             st.markdown("""
-            **SEI** 結合市場相關性與分配公平性，是一個總體市場健康指標。
-            
-            $$ \\text{SEI} = \\rho(\\text{WAR}, \\text{Salary}) \\times (1 - G_{\\text{Salary}}) $$
-            
-            其中 $\\rho$ 為WAR與薪資的相關係數，$G$ 為薪資的基尼係數。
-            """)
-            
-            # 計算 SEI
-            correlation, gini, sei = calculate_sei(df)
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("WAR-薪資相關係數 (ρ)", f"{correlation:.4f}")
-                if correlation > 0.7:
-                    st.success("高度相關 (市場有效率)")
-                elif correlation > 0.3:
-                    st.info("中度相關")
-                else:
-                    st.warning("低度相關 (市場無效率)")
-            
-            with col2:
-                st.metric("薪資基尼係數 (G)", f"{gini:.4f}")
-                if gini < 0.3:
-                    st.success("分配平均")
-                elif gini < 0.5:
-                    st.info("中度不均")
-                else:
-                    st.warning("極度不均 (贏者全拿)")
-            
-            with col3:
-                st.metric("同步效率指數 (SEI)", f"{sei:.4f}")
-                if sei > 0.7:
-                    st.success("健康市場")
-                elif sei > 0.4:
-                    st.info("正常市場")
-                elif sei > 0.2:
-                    st.warning("市場失調")
-                else:
-                    st.error("市場失靈")
-            
-            # 繪製市場狀態圖
-            st.markdown("#### 市場狀態分析")
-            
-            # 創建四種市場狀態的象限圖
-            fig = go.Figure()
-            
-            # 添加四個象限的背景
-            fig.add_shape(type="rect", x0=0, y0=0, x1=0.5, y1=0.5,
-                         line=dict(color="rgba(255,0,0,0.3)"), fillcolor="rgba(255,0,0,0.1)")
-            fig.add_shape(type="rect", x0=0.5, y0=0, x1=1, y1=0.5,
-                         line=dict(color="rgba(255,165,0,0.3)"), fillcolor="rgba(255,165,0,0.1)")
-            fig.add_shape(type="rect", x0=0, y0=0.5, x1=0.5, y1=1,
-                         line=dict(color="rgba(0,255,0,0.3)"), fillcolor="rgba(0,255,0,0.1)")
-            fig.add_shape(type="rect", x0=0.5, y0=0.5, x1=1, y1=1,
-                         line=dict(color="rgba(0,0,255,0.3)"), fillcolor="rgba(0,0,255,0.1)")
-            
-            # 添加市場狀態標籤
-            fig.add_annotation(x=0.25, y=0.25, text="混亂市場", showarrow=False, font=dict(size=12, color="gray"))
-            fig.add_annotation(x=0.75, y=0.25, text="平均主義", showarrow=False, font=dict(size=12, color="gray"))
-            fig.add_annotation(x=0.25, y=0.75, text="菁英市場", showarrow=False, font=dict(size=12, color="gray"))
-            fig.add_annotation(x=0.75, y=0.75, text="理想市場", showarrow=False, font=dict(size=12, color="gray"))
-            
-            # 添加當前市場位置
-            fig.add_trace(go.Scatter(
-                x=[gini],
-                y=[correlation],
-                mode='markers+text',
-                marker=dict(size=20, color='red', symbol='star'),
-                text=['當前市場'],
-                textposition='top center',
-                name='當前位置'
-            ))
-            
-            fig.update_layout(
-                title='市場狀態矩陣',
-                xaxis_title='薪資基尼係數 (G) → 不公平程度',
-                yaxis_title='WAR-薪資相關係數 (ρ) → 效率程度',
-                xaxis_range=[0, 1],
-                yaxis_range=[0, 1],
-                height=500,
-                showlegend=False
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)  # 保留原始參數
-            
-            # 市場狀態解讀
-            st.markdown("""
-            **市場狀態解讀**
-            - **理想市場 (右上)**: 表現決定薪資，且分配合理
-            - **菁英市場 (左上)**: 表現決定薪資，但巨星拿走大部分
-            - **平均主義 (右下)**: 薪資分配平均，但與表現無關
-            - **混亂市場 (左下)**: 表現與薪資無關，且分配極端
+            1. **理想市場 (右上)**: 薪資與表現高度相關，且薪資分配相對合理。
+            2. **菁英市場 (左上)**: 表現決定薪資，但極少數巨星拿走絕大部分預算。
+            3. **平均主義 (右下)**: 薪資分配平均，但薪資水平與場上表現脫節。
+            4. **混亂市場 (左下)**: 表現與薪資無關，且薪資集中在少數人手中。
             """)
 
 elif analysis_mode == "公式與變數說明":
@@ -2561,19 +2518,19 @@ elif analysis_mode == "公式與變數說明":
         st.markdown("""
         ## 分析方法
         
-        ### 1. 回歸分析
+        ### 1. 預期薪資定價模型 (多項式迴歸)
         """)
         
         st.markdown('<div class="formula-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **線性回歸模型**
-        ```
-        薪資 = β₀ + β₁ × WAR + ε
-        ```
-        其中：
-        - β₀：截距項（基本薪資）
-        - β₁：斜率（每單位WAR的薪資價值）
-        - ε：誤差項（市場異常部分）
+        st.markdown(r"""
+        **高次方多項式迴歸模型**
+        
+        為解決傳統線性迴歸無法捕捉頂級球員「稀缺性溢價」的缺陷，本系統升級採用多項式迴歸建立預期薪資基準：
+        $$\widehat{\text{Salary}} = \beta_n \text{WAR}^n + \dots + \beta_1 \text{WAR} + \beta_0$$
+        
+        說明：
+        - 採用 3 至 4 次方可使曲線尾端自然上揚，合理化巨星（如 Aaron Judge, 大谷翔平）的超高薪資，避免其在異常偵測中被系統性誤判為「嚴重高估」。
+        - 設定底薪防呆機制：$\widehat{\text{Salary}} = \max(\widehat{\text{Salary}}, 0.7)$
         """)
         st.markdown('</div>', unsafe_allow_html=True)
         
@@ -2583,10 +2540,6 @@ elif analysis_mode == "公式與變數說明":
         
         st.markdown('<div class="formula-box">', unsafe_allow_html=True)
         st.markdown("""
-        **預期薪資計算**
-        ```
-        expected_salary = β₀ + β₁ × WAR
-        ```
         **薪資殘差計算**
         ```
         salary_residual = actual_salary - expected_salary
@@ -2601,23 +2554,6 @@ elif analysis_mode == "公式與變數說明":
         st.markdown("""
         ### 3. 市場效率指標
         
-        #### 相關係數 (Correlation)
-        """)
-        
-        st.markdown('<div class="formula-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **皮爾遜相關係數**
-        ```
-        r = Σ[(x_i - x̄)(y_i - ȳ)] / √[Σ(x_i - x̄)² Σ(y_i - ȳ)²]
-        ```
-        範圍：-1 到 1
-        - 接近 1：高度正相關
-        - 接近 0：無相關
-        - 接近 -1：高度負相關
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        st.markdown("""
         #### 決定係數 (R²)
         """)
         
@@ -2626,10 +2562,7 @@ elif analysis_mode == "公式與變數說明":
         ```
         R² = 1 - (SS_res / SS_tot)
         ```
-        其中：
-        - SS_res：殘差平方和
-        - SS_tot：總平方和
-        意義：模型解釋的變異比例
+        意義：模型能解釋的薪資變異比例。模型次方數越高，R² 通常越大，但需防範過度擬合 (Overfitting)。
         """)
         st.markdown('</div>', unsafe_allow_html=True)
         
@@ -2643,7 +2576,7 @@ elif analysis_mode == "公式與變數說明":
         ```
         team_efficiency = total_WAR / total_salary
         ```
-        意義：每百萬美元球隊薪資能獲得多少總WAR
+        意義：每百萬美元團隊薪資能獲得多少總 WAR。
         """)
         st.markdown('</div>', unsafe_allow_html=True)
     
@@ -2743,13 +2676,3 @@ st.markdown(f"""
     </p>
 </div>
 """, unsafe_allow_html=True)
-
-
-
-
-
-
-
-
-
-
